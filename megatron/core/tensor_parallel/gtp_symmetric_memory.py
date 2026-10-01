@@ -231,6 +231,23 @@ class RegisteredLIFOPool:
         flat._gtp_wgrad_reuse_event = ready_event
         self._free[(buf.numel(), buf.dtype, group.group_name)].append(flat)
 
+    def reset_completed_reuse_events(self) -> None:
+        """Retire warmup fences before full-iteration capture, retaining registered storage.
+
+        Call outside capture after synchronizing the device. Internal CUDA events recorded
+        by eager work cannot be waited on from capture, even after that work has completed.
+        New releases during capture still attach their normal reuse dependencies.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Reset GTP symmetric reuse events before CUDA-graph capture")
+        buffers = [buf for bucket in self._free.values() for buf in bucket]
+        for buf in buffers:
+            event = getattr(buf, "_gtp_wgrad_reuse_event", None)
+            if event is not None and not event.query():
+                raise RuntimeError("Synchronize GTP symmetric buffer users before resetting events")
+        for buf in buffers:
+            buf._gtp_wgrad_reuse_event = None
+
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
         self._free.clear()
