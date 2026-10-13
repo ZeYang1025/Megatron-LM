@@ -204,13 +204,15 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Run pending backward cleanup and wait on submitted gradient reductions.
+        """Finish backward cleanup, restore sharded bindings, and wait on gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self._run_delayed_post_backward_callbacks()
+        for module in self.forward_order:
+            module.bind_sharded_parameters()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def post_backward(self) -> None:
