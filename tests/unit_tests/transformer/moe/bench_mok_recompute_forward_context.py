@@ -10,9 +10,14 @@ only the installed ``mok`` package and this checkout on ``PYTHONPATH``)::
 By default every rank gets the Kimi-K3 per-rank MoE shape at EP64: 8192 tokens, 14 local
 experts (56 on 4 GPUs, 896 on 64), top-16 routing balanced over the experts as with forced load
 balancing, latent hidden 3584, expert FFN 3072, MXFP8 split per-expert weights in MCore's
-combined FC1 layout and SiTU-GLU (4, 25), i.e. what ``_MoKAutograd`` passes MoK for K3. For each
-``MACROBATCH_SIZES`` entry it reports, as the max over ranks of the median over ``ITERS`` timed
-calls:
+combined FC1 layout and SiTU-GLU (4, 25), i.e. what ``_MoKAutograd`` passes MoK for K3. The
+default MoK config is the tuned one the Kimi-K3 8K option-E recipes launch with (the
+``..._mok_tuned_opte_a4`` recipes inherit it from ``..._mok_tuned_a4``): comm SMs 32/40,
+minibatch 4096, schedule capacity multiplier 0.0625 and macrobatch 262144, measured first;
+``MACROBATCH_SIZES`` adds 139264 (one macrobatch holds every padded routed row at K3, 133,120
+when balanced) and MoK's default 131072. ``MOK_CONFIG='{}'`` measures MoK's default config
+instead. For each ``MACROBATCH_SIZES`` entry it reports, as the max over ranks of the median over
+``ITERS`` timed calls:
 
 * ``forward``: ``build_schedule`` + ``functional.forward``, what MCore's MoK forward runs;
 * ``pack``: ``weights.pack_fc1_gate_up`` of the local experts' FC1 rows and scale blocks;
@@ -26,10 +31,10 @@ check of the rebuilt context against the forward's. The summary scales the rebui
 against MoE recompute at ``MOE_RECOMPUTE_MS`` per layer (8.19 ms, measured on the proxy).
 
 Environment: NUM_LOCAL_TOKENS, HIDDEN_DIM, INTERMEDIATE_DIM, NUM_LOCAL_EXPERTS, TOPK,
-MACROBATCH_SIZES (comma-separated), MOK_CONFIG (JSON of other MoKConfig fields, e.g.
-'{"fwd_num_comm_sms": 32, "bwd_num_comm_sms": 40, "schedule_capacity_multiplier": 0.0625}'),
-ROUTING (balanced | random), PRECISION (mxfp8 | bf16), ACTIVATION (situ | silu), WARMUP, ITERS,
-LAYERS, MICROBATCHES, MOE_RECOMPUTE_MS.
+MACROBATCH_SIZES (comma-separated, default 262144,139264,131072), MOK_CONFIG (JSON of the other
+MoKConfig fields, default the recipes' tuned config above), ROUTING (balanced | random),
+PRECISION (mxfp8 | bf16), ACTIVATION (situ | silu), WARMUP, ITERS, LAYERS, MICROBATCHES,
+MOE_RECOMPUTE_MS.
 """
 
 from __future__ import annotations
@@ -51,9 +56,16 @@ INTERMEDIATE_DIM = int(os.environ.get("INTERMEDIATE_DIM", 3072))
 NUM_LOCAL_EXPERTS = int(os.environ.get("NUM_LOCAL_EXPERTS", 14))
 TOPK = int(os.environ.get("TOPK", 16))
 MACROBATCH_SIZES = [
-    int(size) for size in os.environ.get("MACROBATCH_SIZES", "131072,139264,69632").split(",")
+    int(size) for size in os.environ.get("MACROBATCH_SIZES", "262144,139264,131072").split(",")
 ]
-MOK_CONFIG = json.loads(os.environ.get("MOK_CONFIG", "{}"))
+# The tuned MoK config of the Kimi-K3 8K recipes (macrobatch_size comes from MACROBATCH_SIZES).
+RECIPE_MOK_CONFIG = {
+    "fwd_num_comm_sms": 32,
+    "bwd_num_comm_sms": 40,
+    "minibatch_size": 4096,
+    "schedule_capacity_multiplier": 0.0625,
+}
+MOK_CONFIG = json.loads(os.environ.get("MOK_CONFIG", json.dumps(RECIPE_MOK_CONFIG)))
 ROUTING = os.environ.get("ROUTING", "balanced")
 PRECISION = os.environ.get("PRECISION", "mxfp8")
 ACTIVATION = os.environ.get("ACTIVATION", "situ")
