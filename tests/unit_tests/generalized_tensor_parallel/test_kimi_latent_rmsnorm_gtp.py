@@ -225,9 +225,7 @@ def test_fused_latent_projection_mxfp8_matches_dequantized_reference(
         # 32 tokens: the MXFP8 wgrad GEMM reduces over tokens in 32-element blocks.
         x = torch.randn(32, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         ref_x = x.detach().float().clone().requires_grad_()
-        layer.weight.main_grad = torch.zeros(
-            layer.weight.shape, dtype=torch.float32, device="cuda"
-        )
+        layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=torch.float32, device="cuda")
         # Stand in for DDP, which owns this flag under fused accumulation.
         layer.weight.grad_added_to_main_grad = False
         placeholder_shapes = []

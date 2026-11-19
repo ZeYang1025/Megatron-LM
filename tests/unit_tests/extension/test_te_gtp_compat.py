@@ -119,10 +119,7 @@ def test_source_detection():
     ("parameters", "expected"),
     [
         # TE 0a2ebe94 _LayerNormLinear.forward
-        (
-            ["ctx", "inp", "ln_weight", "ln_bias", "weight", "weight_workspace", "bias", "args"],
-            3,
-        ),
+        (["ctx", "inp", "ln_weight", "ln_bias", "weight", "weight_workspace", "bias", "args"], 3),
         # TE after PR #3493
         (["ctx", "inp", "ln_weight", "ln_bias", "weight", "bias", "fwd_args"], 3),
         (["ctx", "weight", "inp"], 0),

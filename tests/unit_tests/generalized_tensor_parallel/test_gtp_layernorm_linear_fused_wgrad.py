@@ -77,9 +77,7 @@ def _worker(rank, world_size, port, output_size, params_dtype):
         assert layer.layer_norm_weight.shape == (HIDDEN,)
 
         # Stand in for DDP: an FP32 main_grad, plus the fused-accumulation flag reset below.
-        layer.weight.main_grad = torch.zeros(
-            layer.weight.shape, dtype=torch.float32, device="cuda"
-        )
+        layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=torch.float32, device="cuda")
 
         shards = [torch.empty_like(layer.weight) for _ in range(world_size)]
         dist.all_gather(shards, layer.weight.detach(), group=pgc.gtp_remat)

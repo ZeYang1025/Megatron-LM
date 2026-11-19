@@ -242,9 +242,7 @@ def test_gtp_remat_duplicated_rng_is_tp_invariant():
             egtp_remat_world_size=1,
             force_reset_rng=True,
         )
-        return {
-            name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()
-        }
+        return {name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()}
 
     dense = get_gtp_remat_rng_tracker_name()
     duplicated = get_gtp_remat_rng_tracker_name(duplicated=True)
