@@ -30,6 +30,11 @@ check of the rebuilt context against the forward's. The summary scales the rebui
 ``LAYERS x MICROBATCHES`` (default 23 x 32, stage 0 of the 8K TP1 PP4 recipe) and sets it
 against MoE recompute at ``MOE_RECOMPUTE_MS`` per layer (8.19 ms, measured on the proxy).
 
+The bitwise check is a gate: the checked rebuild runs with its new allocations filled with NaN /
+0xFF (so rows it leaves unwritten cannot match by reusing freed blocks that hold identical
+bytes), and after the summary the script exits non-zero, on every rank, if any macrobatch size's
+rebuilt context differs from the forward's on some rank.
+
 Environment: NUM_LOCAL_TOKENS, HIDDEN_DIM, INTERMEDIATE_DIM, NUM_LOCAL_EXPERTS, TOPK,
 MACROBATCH_SIZES (comma-separated, default 262144,139264,131072), MOK_CONFIG (JSON of the other
 MoKConfig fields, default the recipes' tuned config above), ROUTING (balanced | random),
@@ -39,6 +44,7 @@ MOE_RECOMPUTE_MS.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -172,6 +178,34 @@ def _context_bytes(context) -> int:
     return sum(tensor.numel() * tensor.element_size() for _, tensor in _context_tensors(context))
 
 
+@contextlib.contextmanager
+def _deterministic_fill():
+    """Meanwhile torch fills every new tensor: NaN if floating, its maximum value if integer."""
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill = torch.utils.deterministic.fill_uninitialized_memory
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.utils.deterministic.fill_uninitialized_memory = True
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill
+
+
+def _fill_covers_mok_context_dtypes() -> bool:
+    """Whether _deterministic_fill fills new CUDA tensors of the dtypes in MoK's context."""
+    try:
+        with _deterministic_fill():
+            fp8, bf16, scale = (
+                torch.empty(64, dtype=dtype, device="cuda")
+                for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.uint8)
+            )
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+    return bool(fp8.float().isnan().all() and bf16.isnan().all() and (scale == 255).all())
+
+
 def _valid_rows_equal(forward_context, rebuilt_context, schedule, macrobatch_size) -> bool:
     rows = fc1_layout.valid_context_rows(int(schedule.num_tokens.item()), macrobatch_size)
     blocks = rows // fc1_layout.SCALE_BLOCK_ROWS
@@ -251,7 +285,17 @@ def main() -> None:
     packed_bytes = fc1_layout.packed_gate_up_nbytes(
         NUM_LOCAL_EXPERTS, INTERMEDIATE_DIM, HIDDEN_DIM, mxfp8=PRECISION == "mxfp8"
     )
-    summary = []
+    poison = _fill_covers_mok_context_dtypes()
+    _log(
+        rank,
+        "rebuilt-context check: "
+        + (
+            "the checked rebuild's new allocations start as NaN / 0xFF"
+            if poison
+            else "this torch cannot fill new FP8 tensors; the checked rebuild is not poisoned"
+        ),
+    )
+    summary, mismatched = [], []
     for macrobatch_size in MACROBATCH_SIZES:
         config = functional.MoKConfig(**{**MOK_CONFIG, "macrobatch_size": macrobatch_size})
         functional.clear_workspace_cache()
@@ -332,17 +376,24 @@ def main() -> None:
         rebuild_ms = _median_ms(schedule_only, rebuild, device)
         backward_ms = _median_ms(forward_state, lambda s: backward(*s), device)
 
-        # Correctness and memory of one rebuild.
+        # Correctness and memory of one rebuild. The timing loops above freed contexts built from
+        # these same inputs; the rebuild's new allocations are poisoned so that rows it leaves
+        # unwritten cannot match by reusing those blocks.
         schedule, forward_context, _ = run_forward()
         context_bytes = _context_bytes(forward_context)
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         start = torch.cuda.memory_allocated(device)
-        rebuilt = rebuild(schedule)
+        packed = pack()
+        with _deterministic_fill() if poison else contextlib.nullcontext():
+            rebuilt = recompute(schedule, packed)
+        del packed
         torch.cuda.synchronize(device)
         rebuild_peak = torch.cuda.max_memory_allocated(device) - start
         equal = _valid_rows_equal(forward_context, rebuilt, schedule, macrobatch_size)
         all_equal = _max_over_ranks(0.0 if equal else 1.0, device) == 0.0
+        if not all_equal:
+            mismatched.append(macrobatch_size)
         routed_rows = int(schedule.num_tokens.item())
         max_rows = _max_over_ranks(routed_rows, device)
         max_context = _max_over_ranks(context_bytes, device)
@@ -396,6 +447,11 @@ def main() -> None:
     dist.barrier()
     functional.clear_workspace_cache()
     dist.destroy_process_group()
+    if mismatched:
+        # The check is max-reduced over ranks, so every rank exits non-zero together.
+        raise SystemExit(
+            f"rebuilt MoK context differs from the forward context at macrobatch_size {mismatched}"
+        )
 
 
 if __name__ == "__main__":
