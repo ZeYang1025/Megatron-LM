@@ -79,8 +79,9 @@ def _rebuild_forward_context(
     order MOK already relies on: the EP ranks of a pipeline stage run the same schedule, so they
     backpropagate the same layers and microbatches in the same order. The MCore features that
     would reorder MoE backward work (EP A2A overlap, delayed wgrad) are rejected for MOK by
-    TransformerConfig, and whether a call rebuilds depends only on the config and on whether the
-    call replays an activation-recompute region, which is the same on every EP rank.
+    TransformerConfig, and whether a call rebuilds depends only on the layer's
+    ``recompute_forward_context`` setting (from the config) and on whether the call replays an
+    activation-recompute region, which is the same on every EP rank.
     """
     from mok import functional
 
@@ -147,6 +148,18 @@ class _MoKAutograd(torch.autograd.Function):
         """Run MOK forward and retain the state needed by backward."""
         from mok import functional
 
+        # moe_mok_recompute_forward_context: release the context (the first macrobatch's routed
+        # rows, (H + 3I) * 33/32 bytes per row in MXFP8) after forward and rebuild it in backward.
+        # A call that an activation checkpoint replays during backward keeps it: its backward
+        # follows at once. Decided and validated before MOK's first EP collective, so that an
+        # unsupported layer fails on every EP rank before any of them enters MOK's barriers.
+        rebuild_forward_context = module.recompute_forward_context and not _in_autograd_backward()
+        if rebuild_forward_context and shared_output_gate_weight is not None:
+            raise RuntimeError(
+                "MOK cannot rebuild a gated forward context; disable "
+                "moe_mok_recompute_forward_context for MOK-fused gated shared experts"
+            )
+
         num_routed_parameters = len(module.autograd_routed_parameters)
         if len(parameters) != num_routed_parameters + 2:
             raise RuntimeError(
@@ -198,18 +211,8 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.module = module
         ctx.workspace = workspace
         ctx.schedule = schedule
-        # moe_mok_recompute_forward_context: release the context (the first macrobatch's routed
-        # rows, (H + 3I) * 33/32 bytes per row in MXFP8) now and rebuild it in backward. A call
-        # that an activation checkpoint replays during backward keeps it: its backward follows.
-        ctx.rebuild_forward_context = (
-            module.recompute_forward_context and not _in_autograd_backward()
-        )
-        if ctx.rebuild_forward_context and shared_output_gate_weight is not None:
-            raise RuntimeError(
-                "MOK cannot rebuild a gated forward context; disable "
-                "moe_mok_recompute_forward_context for MOK-fused gated shared experts"
-            )
-        ctx.forward_context = None if ctx.rebuild_forward_context else forward_context
+        ctx.rebuild_forward_context = rebuild_forward_context
+        ctx.forward_context = None if rebuild_forward_context else forward_context
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2

@@ -571,13 +571,40 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
             handle.remove()
 
 
+def _unexpected_forward_context_rebuild(
+    config,
+    workspace,
+    schedule,
+    x,
+    shared_gate_weights,
+    shared_up_weights,
+    routed_gate_weights,
+    routed_up_weights,
+    swiglu_limit=None,
+    *,
+    situ_beta=None,
+):
+    """Stand-in with the signature of MOK d59188a's functional.recompute_forward_context."""
+    raise AssertionError("MOK's forward-context rebuild ran unexpectedly")
+
+
 def _mock_backend(
-    monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False, routed_only=False
+    monkeypatch,
+    *,
+    single_grouped=False,
+    gated=True,
+    mxfp8=False,
+    situ=False,
+    routed_only=False,
+    recompute_forward_context=False,
 ):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     package = ModuleType("mok")
     functional = ModuleType("mok.functional")
     functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    if recompute_forward_context:
+        # The adapter checks the installed MOK for the rebuild API when the option is on.
+        functional.recompute_forward_context = _unexpected_forward_context_rebuild
     package.functional = functional
     package.ops = SimpleNamespace(make_routed_d_weight_storage_table=lambda _: object())
     monkeypatch.setitem(sys.modules, "mok", package)
@@ -621,6 +648,7 @@ def _mock_backend(
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
         moe_single_grouped_weight=single_grouped,
+        moe_mok_recompute_forward_context=recompute_forward_context,
         moe_megakernel_backend_config={
             "shared_expert_mode": "native" if routed_only else "auto",
             "fwd_num_comm_sms": 32,
@@ -785,7 +813,84 @@ def test_runtime_requires_output_gate_main_grad(monkeypatch):
         module=module,
         routed_weight_views=(module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
         saved_tensors=(x, probs, shared.gate_weight, *parameters),
+        rebuild_forward_context=False,
+        forward_context=object(),
     )
     functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
     with pytest.raises(RuntimeError, match="DDP to assign param.main_grad"):
         mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
+
+
+# moe_mok_recompute_forward_context wiring with MOK mocked. The GPU tests that run MOK itself
+# (bitwise parity, memory, interleaved layers and microbatches) are in
+# test_mok_recompute_forward_context.py.
+
+
+def _rebuild_call_inputs(monkeypatch, hidden_size=8):
+    """Inputs for one adapter call, routed with the probabilities the adapter receives."""
+    x = torch.zeros((4, hidden_size), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    # Use the probabilities passed in (an activation checkpoint passes a detached copy).
+    monkeypatch.setattr(
+        mok_backend,
+        "routing_map_to_mok_inputs",
+        lambda router_probs, routing_map, topk: (router_probs, routing_map),
+    )
+    return x, probs, experts
+
+
+def test_forward_context_rebuild_switch_checks_mok_support(monkeypatch):
+    module, _, functional = _mock_backend(monkeypatch, gated=None, situ=True, routed_only=True)
+    assert module.recompute_forward_context is False
+    # Switching the option on for one layer runs the checks construction runs with it on.
+    with pytest.raises(ImportError, match="lacks"):
+        module.recompute_forward_context = True
+    assert module.recompute_forward_context is False
+
+    def rebuild_without_situ(
+        config,
+        workspace,
+        schedule,
+        x,
+        shared_gate_weights,
+        shared_up_weights,
+        routed_gate_weights,
+        routed_up_weights,
+        swiglu_limit=None,
+    ):
+        raise AssertionError("unreachable")
+
+    functional.recompute_forward_context = rebuild_without_situ
+    with pytest.raises(ImportError, match="situ_beta"):
+        module.recompute_forward_context = True
+    assert module.recompute_forward_context is False
+
+    functional.recompute_forward_context = _unexpected_forward_context_rebuild
+    module.recompute_forward_context = True
+    assert module.recompute_forward_context is True
+    module.recompute_forward_context = False
+    assert module.recompute_forward_context is False
+
+
+def test_forward_context_rebuild_rejects_gated_shared_expert_before_mok_runs(monkeypatch):
+    module, shared, functional = _mock_backend(
+        monkeypatch, gated=False, recompute_forward_context=True
+    )
+    assert module.recompute_forward_context and module.shared_output_gate_weight is None
+    # A gate attached after the option was switched on: forward fails before any MOK call (each
+    # one an EP collective), so no EP rank enters MOK's barriers.
+    shared.gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16))
+    module._register_shared_weights(shared, use_output_gate=True)
+    calls = []
+    functional.get_workspace = functional.build_schedule = functional.forward = (
+        lambda *args, **kwargs: calls.append(args)
+    )
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+    with pytest.raises(RuntimeError, match="cannot rebuild a gated forward context"):
+        module(x, probs, experts)
+    assert calls == []
+
+    module.recompute_forward_context = False
+    with pytest.raises(ValueError, match="gated shared expert"):
+        module.recompute_forward_context = True

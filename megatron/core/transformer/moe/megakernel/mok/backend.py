@@ -40,6 +40,10 @@ if TYPE_CHECKING:
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
+    # Default of state that __init__ sets (moe_mok_recompute_forward_context off), so a partially
+    # constructed backend behaves as the default.
+    _recompute_forward_context = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -151,10 +155,8 @@ class MoKMegakernel(MegakernelBackend):
             )
 
         # moe_mok_recompute_forward_context: drop MOK's saved forward context after forward and
-        # rebuild it right before backward. Read at forward time, so it can be changed per layer.
-        self.recompute_forward_context = bool(config.moe_mok_recompute_forward_context)
-        if self.recompute_forward_context:
-            self._check_forward_context_rebuild_support()
+        # rebuild it right before backward. The property checks MOK's support when switched on.
+        self.recompute_forward_context = config.moe_mok_recompute_forward_context
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -164,6 +166,23 @@ class MoKMegakernel(MegakernelBackend):
         # once per optimizer iteration while retaining graph-captured addresses.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+
+    @property
+    def recompute_forward_context(self) -> bool:
+        """Whether this layer drops MOK's forward context after forward and rebuilds it in backward.
+
+        Set from ``config.moe_mok_recompute_forward_context`` and switchable per layer. Switching
+        it on checks that the installed MOK can rebuild this layer's context. The rebuild is an
+        expert-parallel collective, so every EP rank must use the same setting for a layer.
+        """
+        return self._recompute_forward_context
+
+    @recompute_forward_context.setter
+    def recompute_forward_context(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled:
+            self._check_forward_context_rebuild_support()
+        self._recompute_forward_context = enabled
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
@@ -222,7 +241,7 @@ class MoKMegakernel(MegakernelBackend):
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
 
     def _check_forward_context_rebuild_support(self) -> None:
-        """Fail at construction if MOK cannot rebuild this layer's forward context."""
+        """Fail as the option is switched on if MOK cannot rebuild this layer's forward context."""
         import inspect
 
         from mok import functional
