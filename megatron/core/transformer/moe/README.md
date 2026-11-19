@@ -703,7 +703,9 @@ and gradient reduce-scatter; the latent projections are sharded only with
 are rejected, because the megakernel would read GTP shards without gathering them.
 `tests/unit_tests/transformer/moe/test_mok_gtp.py` checks on one four-GPU node (EP4, dense GTP4)
 that a latent, routed-only MOK layer reproduces its no-GTP outputs, input gradients and reduced
-gradients, in BF16 and MXFP8 and with shared-expert or whole-MoE recompute.
+gradients, in BF16 and MXFP8 and with shared-expert or whole-MoE recompute. With
+`--moe-mok-recompute-forward-context` on next to dense GTP, the GTP run must also equal the same
+GTP run with the option off, bit for bit, in outputs, input gradients and routed-expert gradients.
 
 
 ### GLU Checkpoint Layout

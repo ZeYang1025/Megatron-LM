@@ -16,12 +16,25 @@ reproduce phase A's outputs, input gradients and fully reduced main_grads (GTP s
 The dense GEMMs see the same gathered weights, the megakernel sees the same routed weights, and both
 phases average every gradient over the same four data-parallel token streams.
 
+The option-E cases run phase B with MoK forward-context recompute
+(``moe_mok_recompute_forward_context``), as the Kimi-K3 option-E GTP recipes do: each microbatch's
+MoE forward drops MoK's saved context and its backward rebuilds it, next to GTP's gathers and
+reduce-scatters and the te_checkpoint replay of the shared experts. Phase A stays the option-off
+reference. A phase C then runs the same GTP4 layer with the option off, and phase B must equal it
+bit for bit in outputs, input gradients and routed-expert gradients: the rebuilt context equals the
+dropped one, and none of these passes an NCCL reduction at EP4 on four GPUs (dense dgrads use
+exactly gathered weights, and expert DP is 1). Dense main_grads are reduce-scattered, so they are
+compared with phase A's at the tolerance only.
+
 Run on one GB200/GB300 node inside the MoK container (four ranks):
 
     torchrun --nproc-per-node 4 -m pytest -q tests/unit_tests/transformer/moe/test_mok_gtp.py
 """
 
+import contextlib
 import inspect
+from typing import NamedTuple
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -42,7 +55,7 @@ TOKENS = 512  # MoK needs at least 512 local tokens, divisible by 256
 MICROBATCHES = 2
 
 
-def _require_mok_node(mxfp8):
+def _require_mok_node(mxfp8, option_e=False):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -55,6 +68,9 @@ def _require_mok_node(mxfp8):
     functional = pytest.importorskip("mok.functional")
     if "situ_beta" not in inspect.signature(functional.forward).parameters:
         pytest.skip("MoK build with routed-only and SiTU support is required")
+    rebuild = getattr(functional, "recompute_forward_context", None)
+    if option_e and (rebuild is None or "situ_beta" not in inspect.signature(rebuild).parameters):
+        pytest.skip("MoK build with a SiTU recompute_forward_context (d59188a) is required")
     te = pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
@@ -66,7 +82,7 @@ def _require_mok_node(mxfp8):
             pytest.skip(f"MXFP8 not available: {reason}")
 
 
-def _config(*, gtp, mxfp8, recompute, latent_opt_in):
+def _config(*, gtp, mxfp8, recompute, latent_opt_in, option_e=False):
     """Kimi-K3's MoE structure at the sizes of the MoK EP4 replay test (test_moe_kernels.py)."""
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -105,6 +121,8 @@ def _config(*, gtp, mxfp8, recompute, latent_opt_in):
         recompute_granularity="selective" if recompute else None,
         recompute_modules=[recompute] if recompute else None,
         moe_megakernel_backend="mok",
+        # Option E: drop MoK's forward context after forward and rebuild it in backward.
+        moe_mok_recompute_forward_context=option_e,
         moe_megakernel_backend_config={
             "shared_expert_mode": "native",
             "fwd_num_comm_sms": 2,
@@ -145,7 +163,18 @@ def _full_main_grad(param, gtp_group):
     return full[: full.shape[0] - param.pad_length].clone()
 
 
-def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkeypatch):
+class _Phase(NamedTuple):
+    weights: dict
+    outputs: list
+    input_grads: list
+    main_grads: dict
+    # Routed-expert parameters: MoK alone computes their gradients (expert DP is 1 here).
+    expert_names: frozenset
+
+
+def _run_phase(
+    *, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkeypatch, option_e=False
+):
     """Build, load, run two microbatches and finalize gradients like production."""
     from mok import functional
 
@@ -158,6 +187,10 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
         get_gpt_layer_with_transformer_engine_submodules,
     )
     from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        _GTP_PARAMS,
+        reset_gtp_state,
+    )
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
         classify_gtp_remat_chains,
@@ -170,6 +203,9 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
     from megatron.core.transformer.spec_utils import get_submodules
     from megatron.core.utils import resolve_gtp_pad_for_alignment
 
+    # Each phase builds a fresh model: drop an earlier GTP phase's chain state and parameters.
+    reset_gtp_state()
+    _GTP_PARAMS.clear()
     Utils.initialize_model_parallel(expert_model_parallel_size=EP, gtp_remat_size=gtp)
     # The shard alignment configure_gtp_remat_from_recipe sets before a production model build.
     monkeypatch.setattr(
@@ -179,7 +215,9 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
     )
     model_parallel_cuda_manual_seed(1234)
     pgc = ProcessGroupCollection.use_mpu_process_groups()
-    config = _config(gtp=gtp, mxfp8=mxfp8, recompute=recompute, latent_opt_in=latent_opt_in)
+    config = _config(
+        gtp=gtp, mxfp8=mxfp8, recompute=recompute, latent_opt_in=latent_opt_in, option_e=option_e
+    )
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
             num_experts=NUM_EXPERTS, moe_grouped_gemm=True
@@ -190,6 +228,7 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
 
     assert config.gtp_weight_remat_size == gtp and config.expert_gtp_weight_remat_size == 1
     assert not layer.megakernel_fuses_shared_expert
+    assert layer.megakernel_experts.recompute_forward_context is option_e
     assert not any(is_gtp_param(p) for p in layer.megakernel_experts.parameters())
     assert not is_gtp_param(layer.router.weight)
     assert not is_gtp_param(layer.fc2_latent_proj.layer_norm_weight)
@@ -228,15 +267,32 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
         # As in production, after the DDP wrap and before the first forward.
         classify_gtp_remat_chains(ddp)
 
+    # Count MoK's context rebuilds. Installed after the build: with option E on, the backend checks
+    # the real function's signature when it is constructed.
+    rebuilds = []
+    real_rebuild = getattr(functional, "recompute_forward_context", None)
+    count_rebuilds = contextlib.nullcontext()
+    if real_rebuild is not None:
+
+        def counting_rebuild(*args, **kwargs):
+            rebuilds.append(None)
+            return real_rebuild(*args, **kwargs)
+
+        count_rebuilds = patch.object(functional, "recompute_forward_context", counting_rebuild)
+
     ddp.zero_grad_buffer()
     outputs, input_grads = [], []
-    for x, upstream in batches:
-        x = x.clone().requires_grad_()
-        with get_fp8_context(config):
-            output, _ = ddp(x)
-        output.backward(upstream)
-        outputs.append(output.detach().float())
-        input_grads.append(x.grad.detach().float())
+    with count_rebuilds:
+        for x, upstream in batches:
+            x = x.clone().requires_grad_()
+            with get_fp8_context(config):
+                output, _ = ddp(x)
+            output.backward(upstream)
+            outputs.append(output.detach().float())
+            input_grads.append(x.grad.detach().float())
+    # Option E rebuilds the one MoK layer's context once per microbatch, in its backward (the
+    # shared-expert checkpoint replays only the shared experts); without it, never.
+    assert len(rebuilds) == (len(batches) if option_e else 0), len(rebuilds)
 
     # finalize_model_grads' order: GTP fence, DP sync, gtp_remat AVG of replicated params.
     if gtp > 1:
@@ -246,10 +302,13 @@ def _run_phase(*, gtp, mxfp8, recompute, latent_opt_in, batches, weights, monkey
     main_grads = {
         name: _full_main_grad(param, pgc.gtp_remat) for name, param in layer.named_parameters()
     }
+    expert_names = frozenset(
+        name for name, param in layer.named_parameters() if not getattr(param, "allreduce", True)
+    )
     torch.cuda.synchronize()
     # Collective over the EP group's symmetric memory: every rank, before the groups go away.
     functional.clear_workspace_cache()
-    return weights, outputs, input_grads, main_grads
+    return _Phase(weights, outputs, input_grads, main_grads, expert_names)
 
 
 def _assert_matches(actual, expected, name, tolerance):
@@ -264,24 +323,49 @@ def _assert_matches(actual, expected, name, tolerance):
     )
 
 
+def _assert_bitwise_equal(actual, expected, name):
+    """Option E against its option-off twin on the same GTP layer: equal bit for bit."""
+    assert actual.dtype == expected.dtype == torch.float32, name
+    assert actual.shape == expected.shape, f"{name}: {tuple(actual.shape)} vs {expected.shape}"
+    differ = int((actual.view(torch.int32) != expected.view(torch.int32)).sum().item())
+    assert differ == 0, (
+        f"{name}: {differ} of {expected.numel()} elements differ bitwise between the GTP run "
+        "with MoK forward-context recompute and the same run without it; the rebuilt context "
+        "must equal the dropped one"
+    )
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
-    ("precision", "recompute", "latent_opt_in"),
+    ("precision", "recompute", "latent_opt_in", "option_e"),
     [
-        pytest.param("bf16", None, False, id="bf16"),
-        pytest.param("bf16", None, True, id="bf16-latent_gtp"),
-        pytest.param("mxfp8", None, False, id="mxfp8"),
-        pytest.param("mxfp8", None, True, id="mxfp8-latent_gtp"),
-        # The Kimi-K3 GTP8 recipe: MoE recompute off, native shared experts recomputed.
-        pytest.param("mxfp8", "shared_experts", True, id="mxfp8-latent_gtp-shared_recompute"),
-        pytest.param("mxfp8", "moe", True, id="mxfp8-latent_gtp-moe_recompute"),
+        pytest.param("bf16", None, False, False, id="bf16"),
+        pytest.param("bf16", None, True, False, id="bf16-latent_gtp"),
+        pytest.param("mxfp8", None, False, False, id="mxfp8"),
+        pytest.param("mxfp8", None, True, False, id="mxfp8-latent_gtp"),
+        # The Kimi-K3 GTP8 recipes turn MoE recompute off and recompute the native shared
+        # experts. F4/P5 keep MoK's forward context and GTP-shard the latent projections.
+        pytest.param(
+            "mxfp8", "shared_experts", True, False, id="mxfp8-latent_gtp-shared_recompute"
+        ),
+        # F5/P6 rebuild it in backward instead (option E) and keep the latent projections
+        # replicated. The option-off twin tells a failure of that GTP layout from an option-E one.
+        pytest.param("mxfp8", "shared_experts", False, True, id="mxfp8-shared_recompute-opte"),
+        pytest.param("mxfp8", "shared_experts", False, False, id="mxfp8-shared_recompute"),
+        # F5/P6 with the latent opt-in their headers name as the next step.
+        pytest.param(
+            "mxfp8", "shared_experts", True, True, id="mxfp8-latent_gtp-shared_recompute-opte"
+        ),
+        pytest.param("mxfp8", "moe", True, False, id="mxfp8-latent_gtp-moe_recompute"),
     ],
 )
-def test_mok_with_dense_gtp_matches_no_gtp(precision, recompute, latent_opt_in, monkeypatch):
+def test_mok_with_dense_gtp_matches_no_gtp(
+    precision, recompute, latent_opt_in, option_e, monkeypatch
+):
     """BF16 recompute is not covered: on this branch MCore's native checkpoint (used for BF16) is
     not recognized as a GTP recompute phase (upstream 93fbedfd8), independently of MoK."""
     mxfp8 = precision == "mxfp8"
-    _require_mok_node(mxfp8)
+    _require_mok_node(mxfp8, option_e)
     from mok import functional
 
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -309,10 +393,11 @@ def test_mok_with_dense_gtp_matches_no_gtp(precision, recompute, latent_opt_in, 
         monkeypatch=monkeypatch,
     )
     try:
-        weights, ref_outputs, ref_input_grads, ref_main_grads = _run_phase(
-            gtp=1, weights=None, **common
-        )
-        _, outputs, input_grads, main_grads = _run_phase(gtp=GTP, weights=weights, **common)
+        # Phase A, the reference, never uses option E.
+        reference = _run_phase(gtp=1, weights=None, **common)
+        run = _run_phase(gtp=GTP, weights=reference.weights, option_e=option_e, **common)
+        # Phase C: the same GTP layer with MoK's context kept.
+        kept = _run_phase(gtp=GTP, weights=reference.weights, **common) if option_e else None
     finally:
         try:
             # A phase that failed after building its workspace must not leave it cached for a
@@ -323,18 +408,36 @@ def test_mok_with_dense_gtp_matches_no_gtp(precision, recompute, latent_opt_in, 
             _GTP_PARAMS.clear()
             Utils.destroy_model_parallel()
 
+    if kept is not None:
+        # First, so that an option-E failure is not reported as a GTP tolerance miss.
+        assert kept.expert_names and kept.expert_names == run.expert_names
+        for microbatch in range(MICROBATCHES):
+            _assert_bitwise_equal(
+                run.outputs[microbatch], kept.outputs[microbatch], f"output[{microbatch}]"
+            )
+            _assert_bitwise_equal(
+                run.input_grads[microbatch],
+                kept.input_grads[microbatch],
+                f"input gradient[{microbatch}]",
+            )
+        for name in sorted(kept.expert_names):
+            _assert_bitwise_equal(run.main_grads[name], kept.main_grads[name], f"main_grad {name}")
+
     tolerance = 3e-2 if mxfp8 else 1e-2
     for microbatch in range(MICROBATCHES):
         _assert_matches(
-            outputs[microbatch], ref_outputs[microbatch], f"output[{microbatch}]", tolerance
+            run.outputs[microbatch],
+            reference.outputs[microbatch],
+            f"output[{microbatch}]",
+            tolerance,
         )
         _assert_matches(
-            input_grads[microbatch],
-            ref_input_grads[microbatch],
+            run.input_grads[microbatch],
+            reference.input_grads[microbatch],
             f"input gradient[{microbatch}]",
             tolerance,
         )
-    assert set(main_grads) == set(ref_main_grads)
-    for name, expected in ref_main_grads.items():
+    assert set(run.main_grads) == set(reference.main_grads)
+    for name, expected in reference.main_grads.items():
         assert expected.abs().sum() > 0, f"{name}: no gradient reached it; the test is vacuous"
-        _assert_matches(main_grads[name], expected, f"main_grad {name}", tolerance)
+        _assert_matches(run.main_grads[name], expected, f"main_grad {name}", tolerance)
