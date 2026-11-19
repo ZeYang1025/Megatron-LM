@@ -4,6 +4,8 @@
 
 > 📦 **Requires TransformerEngine >= 2.19** (GTP support is merged into TE main). On an older TE, GTP is disabled at import (`HAVE_GTP = False`) and enabling it raises an `ImportError` — please install TransformerEngine >= 2.19.
 
+> 🩹 **TE LayerNormLinear placeholder gradient.** With fused weight-gradient accumulation, TE main from 76bea96c (PR #3493) up to be880cc2 (PR #3748) returns an unsharded placeholder weight gradient from a GTP-sharded `LayerNormLinear` (fused-norm linears such as `TELayerNormColumnParallelLinear`), and autograd rejects it. When such a layer is built, Megatron installs an idempotent shim (`megatron/core/extensions/te_gtp_compat.py`) that returns a shard-shaped placeholder instead; it is not installed on fixed TE and changes nothing on older TE such as 0a2ebe94, which returns no placeholder for GTP weights.
+
 **Generalized Tensor Parallelism (GTP)** is a lightweight, high-performance, memory-efficient distributed-training strategy implemented jointly in Megatron-LM and TransformerEngine. It **shards weight tensors across a GTP process group and reconstructs them on demand via asynchronous all-gather**, so larger models fit in the same memory without sacrificing throughput — the communication is overlapped with computation rather than added to it.
 
 GTP splits the weight-parallel domain into two orthogonal sub-axes — **`GTP = TP × GTP_remat`** — so every rank stores `1/(TP × GTP_remat)` of each linear weight, together with the matching slice of its gradient and optimizer state.
@@ -1019,6 +1021,7 @@ done
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 | `test_gtp_ddp_param_sync_race.py` | Parameter-readiness ordering (§3.2): GTP_remat's ahead-of-consume prefetch must not read a bucket DDP has not published. Structural and numerical (stale-value) guards on the default one-weight-ahead chain, the grouped-expert one-block-ahead chain, and the recompute exclusion. |
 | `test_gtp_custom_pgs.py` | `pg_collection` plumbing: a custom `gtp_remat` group (permuted ranks, same size) must give the same fwd/bwd results as the MPU groups — catches modules reading `parallel_state` instead of the collection passed to them. |
+| `test_gtp_layernorm_linear_fused_wgrad.py` | GTP-sharded `TELayerNormColumnParallelLinear` with fused weight-gradient accumulation (FP32/BF16, padded/unpadded): output, dgrad, norm grad and `main_grad` parity, and a shard-shaped (or absent) autograd placeholder gradient. The shim itself is unit-tested in `tests/unit_tests/extension/test_te_gtp_compat.py`. |
 
 The fp32-accumulation primitive itself is covered outside this suite, by `tests/unit_tests/distributed/test_reduce_scatter_with_fp32_accumulation.py`, which does not require GTP_remat.
 

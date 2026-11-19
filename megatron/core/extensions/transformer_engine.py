@@ -592,6 +592,14 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None)
     attach_gtp_to_presharded_module(
         module, gtp_remat_group, pad_length, is_grouped=is_grouped, replica_group=replica_group
     )
+    if isinstance(module, te.pytorch.LayerNormLinear):
+        # TE before be880cc2 may size LayerNormLinear's fused-wgrad placeholder gradient from the
+        # unsharded GEMM scratch; the idempotent shim makes it shard-shaped where needed.
+        from megatron.core.extensions.te_gtp_compat import (
+            apply_layernorm_linear_distributed_wgrad_fix,
+        )
+
+        apply_layernorm_linear_distributed_wgrad_fix()
 
 
 @contextmanager
