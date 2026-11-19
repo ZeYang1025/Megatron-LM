@@ -675,7 +675,9 @@ transient `[E, I, H]` copy for its duration, after checking that every expert's 
 where MOK's weight descriptors (and so the forward) read it. The rebuild is an EP collective that
 runs inside the MOK autograd node's backward, so it keeps MOK's existing EP ordering, and
 gradients are bitwise identical to the default. MOK calls that an activation checkpoint replays
-(`moe` in `recompute_modules`, full recompute) keep their context instead. The option supports
+(`moe` in `recompute_modules`, full recompute) keep their context instead; the config logs a
+warning (through `logging`, so `PYTHONWARNINGS=ignore` does not hide it) when it sees that
+combination. The option supports
 BF16 and MXFP8, both routed weight layouts, and MOK-fused ungated shared experts; MOK cannot
 rebuild a gated fused shared expert's context, so that combination is rejected. The backend's
 `recompute_forward_context` attribute switches the option per layer (every EP rank must switch it

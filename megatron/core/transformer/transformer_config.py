@@ -4348,12 +4348,16 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_granularity == "selective"
                 and "moe" in (self.recompute_modules or [])
             ):
-                warn_single_rank(
+                # Logged, not warnings.warn: a launch with PYTHONWARNINGS=ignore would drop the
+                # only sign that the option does not act on these layers.
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     "moe_mok_recompute_forward_context with recompute_granularity="
                     f"{self.recompute_granularity!r} and recompute_modules="
                     f"{self.recompute_modules}: a MoE layer whose activation recompute replays "
                     "the MOK call keeps its forward context rather than rebuilding it, so the "
-                    "option only acts on MoE layers that are not recomputed."
+                    "option only acts on MoE layers that are not recomputed.",
                 )
 
         # Validation for "mhc" in recompute_modules

@@ -23,6 +23,7 @@ the Kimi-K3 container, from the Megatron-LM checkout::
 
 import contextlib
 import dataclasses
+import logging
 import re
 from typing import NamedTuple, Optional
 from unittest.mock import patch
@@ -121,18 +122,27 @@ def test_config_rejects_unsupported_layers(overrides, error):
 
 
 def test_config_warns_when_moe_recompute_replays_the_call(monkeypatch):
+    """The no-op notice is a logged WARNING, which PYTHONWARNINGS=ignore does not suppress."""
     import megatron.core.transformer.transformer_config as transformer_config
 
     messages = []
     monkeypatch.setattr(
         transformer_config,
+        "log_single_rank",
+        lambda logger, level, msg, *args, **kwargs: messages.append(
+            (level, str(msg % args if args else msg))
+        ),
+    )
+    monkeypatch.setattr(
+        transformer_config,
         "warn_single_rank",
-        lambda message, *args, **kwargs: messages.append(message),
+        lambda message, *args, **kwargs: messages.append((None, message)),
     )
     _mok_config()
-    assert not [m for m in messages if "moe_mok_recompute_forward_context" in m]
+    assert not [m for _, m in messages if "moe_mok_recompute_forward_context" in m]
     _mok_config(recompute_granularity="selective", recompute_modules=["moe"])
-    assert [m for m in messages if "moe_mok_recompute_forward_context" in m]
+    notices = [level for level, m in messages if "moe_mok_recompute_forward_context" in m]
+    assert notices == [logging.WARNING]
 
 
 def test_cli_flag_reaches_the_config_field():
