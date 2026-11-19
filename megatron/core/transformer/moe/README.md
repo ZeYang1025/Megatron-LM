@@ -640,7 +640,7 @@ structure selects routed-only MOK in `auto` mode. Activation selection is indepe
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
 | Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast; dense GTP requires native shared execution, expert GTP is unsupported |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
-| Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
+| Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native; MOK forward-context recompute (`--moe-mok-recompute-forward-context`, MOK d59188a or newer, not with a MOK-fused gated shared expert) |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
@@ -661,6 +661,25 @@ both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 ca
 Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
 per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
 static input token counts alone do not establish that lifecycle.
+
+Without MoE-layer recompute, MOK keeps a forward context from each MoE forward to its backward:
+FP8 copies of the first macrobatch's dispatched input, gate, up and activation output, sized by
+`macrobatch_size` at `(H + 3 * I) * 33 / 32` bytes per row in MXFP8 (1.61 GiB per layer and
+microbatch for Kimi-K3's latent `H = 3584`, `I = 3072` at the default 131072 rows).
+`--moe-mok-recompute-forward-context` releases that context after forward and rebuilds it right
+before the layer's backward with MOK's `functional.recompute_forward_context` (MOK d59188a or
+newer). The rebuild reruns only dispatch, routed FC1 and the activation for that macrobatch, not
+the router, latent projections, FC2 or combine. Because the rebuild op accepts only contiguous
+gate/up weights, MCore packs each expert's combined FC1 rows (and MXFP8 scale blocks) into a
+transient `[E, I, H]` copy for its duration, after checking that every expert's payload is still
+where MOK's weight descriptors (and so the forward) read it. The rebuild is an EP collective that
+runs inside the MOK autograd node's backward, so it keeps MOK's existing EP ordering, and
+gradients are bitwise identical to the default. MOK calls that an activation checkpoint replays
+(`moe` in `recompute_modules`, full recompute) keep their context instead. The option supports
+BF16 and MXFP8, both routed weight layouts, and MOK-fused ungated shared experts; MOK cannot
+rebuild a gated fused shared expert's context, so that combination is rejected. The backend's
+`recompute_forward_context` attribute switches the option per layer (every EP rank must switch it
+alike), with the same checks as the flag.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed

@@ -23,6 +23,9 @@ from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
+    pack_fc1_gate_up,
+    routed_fc1_expert_views,
+    split_rowwise_payload_ptrs,
 )
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
@@ -63,6 +66,11 @@ def _reject_gtp_sharded_inputs(named_weights) -> None:
 
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
+
+    # Defaults of state that __init__ sets (moe_mok_recompute_forward_context off, no routed FC1
+    # descriptor payloads recorded), so a partially constructed backend behaves as the default.
+    _recompute_forward_context = False
+    _routed_fc1_payload_record = None
 
     def __init__(
         self,
@@ -178,6 +186,10 @@ class MoKMegakernel(MegakernelBackend):
                 shared_experts, use_output_gate=config.moe_shared_expert_gate
             )
 
+        # moe_mok_recompute_forward_context: drop MOK's saved forward context after forward and
+        # rebuild it right before backward. The property checks MOK's support when switched on.
+        self.recompute_forward_context = config.moe_mok_recompute_forward_context
+
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
@@ -186,6 +198,27 @@ class MoKMegakernel(MegakernelBackend):
         # once per optimizer iteration while retaining graph-captured addresses.
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
+        # (split routed FC1 view, per-expert payload addresses its descriptor tables hold),
+        # recorded when that view is built; the forward-context rebuild checks it packs the same
+        # payloads MOK's forward read.
+        self._routed_fc1_payload_record = None
+
+    @property
+    def recompute_forward_context(self) -> bool:
+        """Whether this layer drops MOK's forward context after forward and rebuilds it in backward.
+
+        Set from ``config.moe_mok_recompute_forward_context`` and switchable per layer. Switching
+        it on checks that the installed MOK can rebuild this layer's context. The rebuild is an
+        expert-parallel collective, so every EP rank must use the same setting for a layer.
+        """
+        return self._recompute_forward_context
+
+    @recompute_forward_context.setter
+    def recompute_forward_context(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled:
+            self._check_forward_context_rebuild_support()
+        self._recompute_forward_context = enabled
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
@@ -242,6 +275,62 @@ class MoKMegakernel(MegakernelBackend):
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients."""
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
+
+    def _check_forward_context_rebuild_support(self) -> None:
+        """Fail as the option is switched on if MOK cannot rebuild this layer's forward context."""
+        import inspect
+
+        from mok import functional
+
+        rebuild = getattr(functional, "recompute_forward_context", None)
+        if rebuild is None:
+            raise ImportError(
+                "moe_mok_recompute_forward_context needs mok.functional.recompute_forward_context, "
+                "which the installed mixture-of-kittens lacks; install a MOK build that has it "
+                "(e.g. d59188a) or disable --moe-mok-recompute-forward-context"
+            )
+        if self.situ_beta is not None and "situ_beta" not in inspect.signature(rebuild).parameters:
+            raise ImportError(
+                "moe_mok_recompute_forward_context with SiTU-GLU needs a MOK whose "
+                "recompute_forward_context accepts situ_beta; the installed MOK does not"
+            )
+        if self.shared_output_gate_weight is not None:
+            # MOK's rebuild is ungated: it cannot recreate the gated shared output S and gate G
+            # that a gated backward consumes.
+            raise ValueError(
+                "moe_mok_recompute_forward_context does not support a MOK-fused gated shared "
+                "expert (moe_shared_expert_gate); set shared_expert_mode to 'native' in "
+                "moe_megakernel_backend_config or disable the option"
+            )
+
+    def routed_fc1_recompute_weights(self, fc1_weight_view):
+        """Return routed FC1 packed into the contiguous gate/up layout MOK's rebuild accepts.
+
+        ``fc1_weight_view`` is the routed FC1 view the layer's forward passed MOK. The packed
+        tensors are transient copies (``2 * E * I * H`` payload bytes); the caller drops them as
+        soon as the rebuild is enqueued.
+        """
+        descriptor_payload_ptrs = None
+        if not self.native_single_grouped_weights:
+            record = self._routed_fc1_payload_record
+            if record is None or record[0] is not fc1_weight_view:
+                raise RuntimeError(
+                    "MOK forward-context rebuild: the routed FC1 weight view this microbatch's "
+                    "forward used is no longer the cached one (were the weights reloaded or moved "
+                    "between its forward and backward?)"
+                )
+            descriptor_payload_ptrs = record[1]
+        payloads, scales = routed_fc1_expert_views(
+            fc1_weight_view,
+            self.routed_fc1_parameters,
+            num_experts=self.num_local_experts,
+            intermediate_size=self.intermediate_size,
+            hidden_size=self.hidden_size,
+            use_mxfp8=self.use_mxfp8_weights,
+            single_grouped=self.native_single_grouped_weights,
+            descriptor_payload_ptrs=descriptor_payload_ptrs,
+        )
+        return pack_fc1_gate_up(payloads, scales, self.intermediate_size)
 
     @torch.no_grad()
     def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
@@ -330,6 +419,15 @@ class MoKMegakernel(MegakernelBackend):
                 columns=self.intermediate_size,
                 cached_view=cached_fc2,
             )
+            if cached_fc1 is None and not self.native_single_grouped_weights:
+                # The new view's descriptor tables address these per-expert payloads (a refresh
+                # rewrites only scales). Host-side bookkeeping for the forward-context rebuild.
+                self._routed_fc1_payload_record = (
+                    fc1_weight_view,
+                    split_rowwise_payload_ptrs(
+                        self.routed_fc1_parameters, use_mxfp8=self.use_mxfp8_weights
+                    ),
+                )
             self._routed_weight_view_cache = (fc1_weight_view, fc2_weight_view)
 
         self.is_first_microbatch = False
@@ -375,6 +473,7 @@ class MoKMegakernel(MegakernelBackend):
         del state_dict, prefix, local_metadata, strict
         del missing_keys, unexpected_keys, error_msgs
         self._routed_weight_view_cache = None
+        self._routed_fc1_payload_record = None
         self._split_main_grad_descriptor_cache = None
         self.is_first_microbatch = True
 
@@ -411,6 +510,7 @@ class MoKMegakernel(MegakernelBackend):
                 setattr(new_param, key, value)
         # Device/dtype conversion invalidates cached storage views and descriptors.
         self._routed_weight_view_cache = None
+        self._routed_fc1_payload_record = None
         self._split_main_grad_descriptor_cache = None
         self.is_first_microbatch = True
         return out
