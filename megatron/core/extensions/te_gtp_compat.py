@@ -24,6 +24,11 @@ a distributed weight whose shape differs from it, using TE's own ``get_dummy_wgr
 changes a gradient on builds where that branch is unreachable, and it is not installed on fixed
 builds.
 
+TE caches placeholders by shape, so on an affected build each replaced, unsharded placeholder
+would otherwise stay cached (one full-size buffer per distinct GTP ``LayerNormLinear`` shape for
+the whole run). The wrapper drops that cache entry after replacing it; TE allocates the buffer
+again, transiently, on its next backward.
+
 The helpers above the patch function are pure Python so they can be tested without torch.
 """
 
@@ -102,6 +107,32 @@ def _origin_weight_before_backward(ctx):
     return ref() if ref is not None else None
 
 
+def _storage_address(tensor) -> int:
+    """Address of a tensor's storage, or 0 if it has none (e.g. a ZeroTensor placeholder)."""
+    try:
+        if tensor._is_zerotensor():
+            return 0
+        return tensor.untyped_storage().data_ptr()
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return 0
+
+
+def _evict_cached_placeholder(cache, placeholder) -> None:
+    """Drop the entry of TE's placeholder cache that backs ``placeholder``, if any.
+
+    TE returns a detached view of the cached tensor, so the entry is found by storage, not by key
+    (the key layout differs between TE builds). Only the replaced placeholder's own entry goes.
+    """
+    if not isinstance(cache, dict):
+        return
+    address = _storage_address(placeholder)
+    if address == 0:
+        return
+    for key, cached in list(cache.items()):
+        if _storage_address(cached) == address and tuple(cached.shape) == tuple(placeholder.shape):
+            del cache[key]
+
+
 def _accepts_keyword(function: Callable, name: str) -> bool:
     try:
         return name in inspect.signature(function).parameters
@@ -109,8 +140,14 @@ def _accepts_keyword(function: Callable, name: str) -> bool:
         return False
 
 
-def _wrap_backward(backward: Callable, index: int, get_dummy_wgrad: Callable) -> Callable:
-    """Return ``backward`` with a shard-shaped placeholder for distributed weights."""
+def _wrap_backward(
+    backward: Callable, index: int, get_dummy_wgrad: Callable, dummy_wgrad_cache=None
+) -> Callable:
+    """Return ``backward`` with a shard-shaped placeholder for distributed weights.
+
+    ``dummy_wgrad_cache`` is the dict behind ``get_dummy_wgrad`` (TE's ``_dummy_wgrads``); the
+    replaced full-size placeholder's entry is dropped from it. ``None`` skips that step.
+    """
     supports_zero_tensor = _accepts_keyword(get_dummy_wgrad, "zero_tensor")
 
     def backward_with_shard_shaped_placeholder(ctx, *grad_outputs):
@@ -133,6 +170,8 @@ def _wrap_backward(backward: Callable, index: int, get_dummy_wgrad: Callable) ->
             kwargs["zero_tensor"] = getattr(origin_weight, "zero_tensor_dummy_wgrad", False)
         grads = list(grads)
         grads[index] = get_dummy_wgrad(list(origin_weight.shape), origin_weight.dtype, **kwargs)
+        # Do not keep TE's unsharded placeholder cached for the rest of the run.
+        _evict_cached_placeholder(dummy_wgrad_cache, placeholder)
         return tuple(grads)
 
     backward_with_shard_shaped_placeholder.__doc__ = backward.__doc__
@@ -153,7 +192,7 @@ def _log_rank_0(level: int, message: str) -> None:
 
 
 def apply_layernorm_linear_distributed_wgrad_fix(
-    function_cls=None, get_dummy_wgrad=None, source: Optional[str] = None
+    function_cls=None, get_dummy_wgrad=None, source: Optional[str] = None, dummy_wgrad_cache=None
 ) -> str:
     """Patch TE's ``_LayerNormLinear.backward`` once if the installed TE needs it.
 
@@ -164,6 +203,8 @@ def apply_layernorm_linear_distributed_wgrad_fix(
         function_cls: The autograd Function to patch (default: TE's ``_LayerNormLinear``).
         get_dummy_wgrad: Placeholder factory (default: the one TE's module uses).
         source: Source to inspect for the bug (default: the module defining ``function_cls``).
+        dummy_wgrad_cache: The placeholder cache behind ``get_dummy_wgrad`` (default: the
+            ``_dummy_wgrads`` dict of the module defining it, when there is one).
 
     Returns:
         One of ``"patched"``, ``"already-patched"``, ``"not-needed"`` (fixed TE),
@@ -206,6 +247,8 @@ def apply_layernorm_linear_distributed_wgrad_fix(
         get_dummy_wgrad = getattr(module, "get_dummy_wgrad", None)
         if get_dummy_wgrad is None:
             from transformer_engine.pytorch.module.base import get_dummy_wgrad
+    if dummy_wgrad_cache is None:
+        dummy_wgrad_cache = getattr(inspect.getmodule(get_dummy_wgrad), "_dummy_wgrads", None)
 
     forward = inspect.getattr_static(function_cls, "forward", None)
     if isinstance(forward, staticmethod):
@@ -226,7 +269,9 @@ def apply_layernorm_linear_distributed_wgrad_fix(
         )
         return UNSUPPORTED
 
-    function_cls.backward = staticmethod(_wrap_backward(backward, index, get_dummy_wgrad))
+    function_cls.backward = staticmethod(
+        _wrap_backward(backward, index, get_dummy_wgrad, dummy_wgrad_cache)
+    )
     _log_rank_0(
         logging.INFO,
         f"Wrapped {function_cls.__qualname__}.backward (TE before be880cc2): a placeholder weight "

@@ -168,6 +168,26 @@ def test_fix_returns_shard_shaped_placeholder(zero_out_wgrad):
     torch.testing.assert_close(weight.scratch, inp.detach().sum(dim=0).expand_as(weight.scratch))
 
 
+def test_fix_evicts_the_unsharded_placeholder_from_the_cache():
+    """The replaced full-size placeholder must not stay cached; other entries stay."""
+    function = _make_function()
+    outcome = apply_layernorm_linear_distributed_wgrad_fix(
+        function, _dummy_wgrad, source=_BUGGY_SOURCE, dummy_wgrad_cache=_PLACEHOLDERS
+    )
+    assert outcome == PATCHED
+    unrelated_key = (4, 3, torch.float64)
+    unrelated = _PLACEHOLDERS.setdefault(unrelated_key, torch.zeros(4, 3, dtype=torch.float64))
+    weight = _sharded_weight()
+
+    for _ in range(2):  # TE re-creates the full-size placeholder each backward; it goes again.
+        _run(function, weight)
+        assert weight.grad.shape == weight.shape
+        assert (4, 3, torch.float32) not in _PLACEHOLDERS
+        assert (2, 3, torch.float32) in _PLACEHOLDERS
+        assert _PLACEHOLDERS[unrelated_key] is unrelated
+        weight.grad = None
+
+
 def test_fix_is_idempotent_and_keeps_original_backward():
     function = _make_function()
     original = function.backward
