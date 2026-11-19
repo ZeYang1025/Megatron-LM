@@ -256,6 +256,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_recompute": False,
     "moe_megakernel_backend": None,
     "moe_megakernel_backend_config": None,
+    "moe_mok_recompute_forward_context": False,
     "moe_n_hash_layers": 0,
     "moe_ncclep_static_shape": None,
     "moe_num_hash_layers": 0,
