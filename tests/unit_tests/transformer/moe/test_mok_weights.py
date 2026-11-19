@@ -205,6 +205,85 @@ def test_mok_rejects_key_incompatible_configurations(overrides, error):
         _mok_transformer_config(**overrides)
 
 
+_NATIVE_SHARED = {"moe_megakernel_backend_config": {"shared_expert_mode": "native"}}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Native shared experts: MOK reads only routed weights, which expert GTP 1 never shards.
+        {"gtp_weight_remat_size": 2, **_NATIVE_SHARED},
+        # The user-facing knob resolves to the same dense GTP degree.
+        {"tensor_parallel_num_weight_shards": 4, **_NATIVE_SHARED},
+        # No shared expert: there is nothing for auto mode to fuse.
+        {"gtp_weight_remat_size": 2, "moe_shared_expert_intermediate_size": None},
+        # A structurally incompatible shared expert makes auto mode resolve to native.
+        {"gtp_weight_remat_size": 2, "moe_shared_expert_intermediate_size": 512},
+        # Kimi-K3-like routed-only MXFP8 with SiTU-GLU.
+        {
+            "tensor_parallel_num_weight_shards": 8,
+            "fp8": "hybrid",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+            "activation_func": situlu,
+            **_NATIVE_SHARED,
+        },
+    ],
+)
+def test_mok_accepts_dense_gtp_with_native_shared_experts(overrides):
+    config = _mok_transformer_config(**overrides)
+    assert config.gtp_weight_remat_size > 1
+    assert config.expert_gtp_weight_remat_size == 1
+    assert not megakernel_fuses_shared_expert(config)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        # Auto mode fuses the compatible default shared expert into the megakernel.
+        ({"gtp_weight_remat_size": 2}, "requires shared experts to run natively"),
+        (
+            {
+                "tensor_parallel_num_weight_shards": 2,
+                "moe_megakernel_backend_config": {"shared_expert_mode": "fused"},
+            },
+            "requires shared experts to run natively",
+        ),
+        ({"expert_gtp_weight_remat_size": 2, **_NATIVE_SHARED}, "does not support expert GTP"),
+        (
+            {"expert_tensor_parallel_num_weight_shards": 2, **_NATIVE_SHARED},
+            "does not support expert GTP",
+        ),
+        (
+            {
+                "tensor_parallel_num_weight_shards": 2,
+                "expert_tensor_parallel_num_weight_shards": 2,
+                **_NATIVE_SHARED,
+            },
+            "does not support expert GTP",
+        ),
+    ],
+)
+def test_mok_rejects_gtp_on_weights_the_megakernel_reads(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _mok_transformer_config(**overrides)
+
+
+def test_mok_backend_rejects_gtp_sharded_inputs():
+    """The backend refuses GTP shards even if a process-group collection disagrees with
+    the config, because the megakernel reads its registered weights without gathering."""
+    from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+
+    holder = torch.nn.Module()
+    holder.register_parameter("routed_fc1_weight0", torch.nn.Parameter(torch.zeros(2, 2)))
+    holder.register_parameter("shared_fc1_weight", None)
+    MoKMegakernel._reject_gtp_sharded_weights(holder)
+
+    holder.routed_fc1_weight0.is_gtp_weight_remat = True
+    with pytest.raises(ValueError, match="routed_fc1_weight0"):
+        MoKMegakernel._reject_gtp_sharded_weights(holder)
+
+
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
     with pytest.raises(ValueError, match="whole-layer CUDA Graph capture"):

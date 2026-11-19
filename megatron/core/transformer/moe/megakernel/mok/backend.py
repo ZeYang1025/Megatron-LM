@@ -147,6 +147,7 @@ class MoKMegakernel(MegakernelBackend):
             self._register_shared_weights(
                 shared_experts, use_output_gate=config.moe_shared_expert_gate
             )
+        self._reject_gtp_sharded_weights()
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -208,6 +209,27 @@ class MoKMegakernel(MegakernelBackend):
             fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
             self._split_main_grad_descriptor_cache = (fingerprint, (fc1_table, fc2_table))
         return main_grads, self._split_main_grad_descriptor_cache[1]
+
+    def _reject_gtp_sharded_weights(self) -> None:
+        """Fail fast if any weight MOK reads directly is a GTP shard.
+
+        MOK consumes the registered routed (and fused shared) weights inside the
+        megakernel, so a GTP shard would reach it with no all-gather and no gradient
+        reduce-scatter. TransformerConfig rejects expert GTP and dense GTP with fused
+        shared experts; this catches a process-group collection that disagrees with it.
+        Dense GTP is fine otherwise: native shared experts, the router and the latent
+        projections are not registered here and rematerialize their own shards.
+        """
+        sharded = [
+            name
+            for name, param in self.named_parameters(recurse=False)
+            if getattr(param, "is_gtp_weight_remat", False)
+        ]
+        if sharded:
+            raise ValueError(
+                "MOK cannot consume GTP-sharded weights; the megakernel bypasses GTP's weight "
+                f"gather and gradient reduce-scatter. GTP-sharded MOK inputs: {sharded}"
+            )
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients."""
