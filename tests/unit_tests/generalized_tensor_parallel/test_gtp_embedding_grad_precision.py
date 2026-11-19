@@ -6,12 +6,15 @@ Adapted from PR #8109 (a717f9e76), which promoted every low-precision wgrad to a
 copy. Here the FP32 reduction is opt-in and chunked, so the cases are: the opt-in path and the
 existing fp32-accumulation reduce-scatter must match an FP32 all-reduce reference exactly, and
 the default reduce-scatter in the wgrad dtype must not (which shows the data tells them apart).
+Every case also checks that each weight fires grad-ready exactly once per backward, and one case
+opts in only one of two chained weights, which is how the embedding sits among untagged linears.
 
 Four ranks on one node:
     torchrun --nproc-per-node 4 -m pytest -x -v \
         tests/unit_tests/generalized_tensor_parallel/test_gtp_embedding_grad_precision.py
 """
 
+import functools
 import warnings
 
 import pytest
@@ -94,10 +97,34 @@ def _finish_pending_reduce_scatters(weights):
     torch.cuda.synchronize()
 
 
-def _run_two_embeddings(dtype, num_rows, fp32_embedding_wgrad):
-    """Two GTP embedding tables read by one loss (so the second has a chain predecessor and its
-    reduce-scatter is async when async_reduction is on). Returns (weights, expected shards)."""
+def _count_grad_ready(counts, index):
+    counts[index] += 1
+
+
+def _count_grad_ready_fires(weights):
+    """Register DDP's grad-ready hook as a counter. GTP fires it itself, once a weight's reduced
+    gradient is in main_grad, so it shows each weight was finalized exactly once."""
+    counts = [0] * len(weights)
+    for index, weight in enumerate(weights):
+        weight.register_grad_accum_hook(None, functools.partial(_count_grad_ready, counts, index))
+    return counts
+
+
+def _run_two_embeddings(dtype, num_rows, fp32_embedding_wgrad, after_backward=None):
+    """Two GTP embedding tables read by one loss, chained in that order: the first is the chain
+    head (its reduce-scatter is sync) and the second has a predecessor (its reduce-scatter is
+    async when async_reduction is on, and the first's backward cascade finalizes it).
+
+    ``fp32_embedding_wgrad`` opts both weights in (a bool) or each one separately (a pair).
+    ``after_backward(weights)`` runs right after ``.backward()``, before any reduce-scatter still
+    in flight is finalized.
+
+    Returns:
+        (weights, expected main_grad shards, grad-ready fires per weight).
+    """
     world_size = dist.get_world_size()
+    if isinstance(fp32_embedding_wgrad, bool):
+        fp32_embedding_wgrad = (fp32_embedding_wgrad, fp32_embedding_wgrad)
     initial = torch.arange(num_rows * HIDDEN, device="cuda", dtype=torch.float32)
     initial = (initial.view(num_rows, HIDDEN) / 100).to(dtype)
     indices = torch.arange(num_rows, device="cuda")
@@ -114,18 +141,21 @@ def _run_two_embeddings(dtype, num_rows, fp32_embedding_wgrad):
     weights = [module.first, module.second]
     pad_rows = weights[0].pad_length
     assert weights[0].shape[0] * world_size == num_rows + pad_rows
-    for p in weights:
+    for p, tagged in zip(weights, fp32_embedding_wgrad):
         p.main_grad = torch.zeros_like(p, dtype=torch.float32)
-        p._wgrad_reduce_in_fp32 = fp32_embedding_wgrad
+        p._wgrad_reduce_in_fp32 = tagged
+    grad_ready = _count_grad_ready_fires(weights)
     outputs = [F.embedding(indices, GTPEmbeddingWeight.apply(p)) for p in weights]
     for actual, baseline in zip(outputs, reference_out):
         torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
     (outputs[0].float() * upstream - outputs[1].float() * upstream / 2).sum().backward()
+    if after_backward is not None:
+        after_backward(weights)
     _finish_pending_reduce_scatters(weights)
 
     mean = not GTP_CONFIG.calculate_per_token_loss
     expected = [_expected_shard(p.grad, pad_rows, mean) for p in reference]
-    return weights, expected
+    return weights, expected, grad_ready
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -139,9 +169,10 @@ def test_embedding_wgrad_reduction_precision(restore_gtp_config, dtype, async_re
         calculate_per_token_loss=False,
         reduce_scatter_with_fp32_accumulation=(path == "fp32_accum_rs"),
     )
-    weights, expected = _run_two_embeddings(
+    weights, expected, grad_ready = _run_two_embeddings(
         dtype, num_rows=16, fp32_embedding_wgrad=(path == "fp32_embedding_wgrad")
     )
+    assert grad_ready == [1, 1]
     for p, wanted in zip(weights, expected):
         assert p.main_grad.dtype == torch.float32
         if path == "default":
@@ -150,6 +181,55 @@ def test_embedding_wgrad_reduction_precision(restore_gtp_config, dtype, async_re
             torch.testing.assert_close(p.main_grad, wanted, rtol=1e-2, atol=0)
         else:
             torch.testing.assert_close(p.main_grad, wanted, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("tagged", [0, 1], ids=["chain_head", "mid_chain"])
+def test_fp32_embedding_wgrad_next_to_an_untagged_weight(restore_gtp_config, dtype, tagged):
+    """Only one of the two chained weights opts in, which is how the embedding sits in K3.
+
+    chain_head (stage 0): the tagged weight heads the chain and its untagged successor's async
+    reduce-scatter is still in flight on the same communicator while the FP32 path runs its
+    all-to-alls; the cascade after the FP32 path must still finalize that reduce-scatter.
+
+    mid_chain (the MTP stage): the tagged weight has a predecessor, so its reduce-scatter would
+    have been async. The FP32 path runs synchronously instead and leaves no handle, so the
+    predecessor's cascade finds nothing to drain.
+
+    Either way nothing is left in flight when backward returns, each weight fires grad-ready
+    exactly once, the tagged weight is exact and the untagged one keeps the low-precision result.
+    """
+    _require_four_ranks()
+    update_gtp_config(
+        pad_for_alignment=1,
+        async_reduction=True,
+        calculate_per_token_loss=False,
+        reduce_scatter_with_fp32_accumulation=False,
+    )
+    in_flight_after_backward = []
+
+    def record_in_flight(weights):
+        in_flight_after_backward.extend(p._wgrad_rs_handle is not None for p in weights)
+
+    weights, expected, grad_ready = _run_two_embeddings(
+        dtype,
+        num_rows=16,
+        fp32_embedding_wgrad=(tagged == 0, tagged == 1),
+        after_backward=record_in_flight,
+    )
+    # Only an async reduce-scatter reserves an output ticket (the sync chain head and the FP32
+    # path never do), so this shows chain_head really ran the FP32 path while the successor's
+    # reduce-scatter was in flight, and mid_chain really replaced an async one.
+    assert (weights[1]._rs_ticket is not None) == (tagged == 0)
+    assert weights[0]._rs_ticket is None
+    assert in_flight_after_backward == [False, False], "backward left a reduce-scatter in flight"
+    assert grad_ready == [1, 1]
+    for index, (p, wanted) in enumerate(zip(weights, expected)):
+        if index == tagged:
+            torch.testing.assert_close(p.main_grad, wanted, rtol=0, atol=0)
+        else:
+            assert not torch.equal(p.main_grad, wanted)
+            torch.testing.assert_close(p.main_grad, wanted, rtol=1e-2, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -175,8 +255,11 @@ def test_fp32_embedding_wgrad_chunked_and_padded(
         (3, 6),
         (6, 8),
     ]
-    weights, expected = _run_two_embeddings(dtype, num_rows=18, fp32_embedding_wgrad=True)
+    weights, expected, grad_ready = _run_two_embeddings(
+        dtype, num_rows=18, fp32_embedding_wgrad=True
+    )
     assert weights[0].pad_length == 2
+    assert grad_ready == [1, 1]
     for p, wanted in zip(weights, expected):
         torch.testing.assert_close(p.main_grad, wanted, rtol=0, atol=0)
 
@@ -219,12 +302,14 @@ def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32
         with torch.no_grad():
             weight.zero_()
         weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        grad_ready = _count_grad_ready_fires([weight])
 
         upstream = _upstream(num_rows)
         output = embedding(torch.arange(num_rows, device="cuda").view(1, num_rows))
         (output.float() * upstream.view(1, num_rows, HIDDEN)).sum().backward()
         _finish_pending_reduce_scatters([weight])
 
+        assert grad_ready == [1]
         # Every row is looked up once, so the local wgrad is the upstream gradient itself.
         wanted = _expected_shard(upstream.to(torch.bfloat16), weight.pad_length, mean=True)
         if fp32_embedding_wgrad:
