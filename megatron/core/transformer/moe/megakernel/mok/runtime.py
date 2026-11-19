@@ -53,6 +53,62 @@ def _gate_up_main_grad_arguments(main_grads, main_grad_storage_tables, intermedi
     return split_main_grads, (routed_fc1_table, routed_fc1_table, routed_fc2_table)
 
 
+def _in_autograd_backward() -> bool:
+    """Return whether this thread is executing an autograd GraphTask.
+
+    An activation checkpoint replays its region's forward inside the checkpoint node's backward
+    and backpropagates the replayed region right after it.
+    """
+    return torch._C._current_graph_task_id() != -1
+
+
+def _rebuild_forward_context(
+    module: "MoKMegakernel", workspace, schedule, x: torch.Tensor, shared_fc1, fc1_weight_view
+):
+    """Recompute the MOK forward context that forward dropped (moe_mok_recompute_forward_context).
+
+    MOK's ``recompute_forward_context`` reruns dispatch, FC1 and the activation for the first
+    macrobatch from the forward's input, schedule, config and weights. MOK's kernels are
+    deterministic and only bytes move when FC1 is packed, so the rebuilt context equals the
+    dropped one on every row MOK wrote.
+
+    The rebuild is an expert-parallel collective: it copies ``x`` into the symmetric dispatch
+    buffer and reads the peers' buffers between MOK device barriers. Every EP rank must therefore
+    reach it for the same layer and microbatch in the same order. It runs inside this autograd
+    node's backward right before MOK's backward, itself an EP collective, so it inherits the
+    order MOK already relies on: the EP ranks of a pipeline stage run the same schedule, so they
+    backpropagate the same layers and microbatches in the same order. The MCore features that
+    would reorder MoE backward work (EP A2A overlap, delayed wgrad) are rejected for MOK by
+    TransformerConfig, and whether a call rebuilds depends only on the layer's
+    ``recompute_forward_context`` setting (from the config) and on whether the call replays an
+    activation-recompute region, which is the same on every EP rank.
+    """
+    from mok import functional
+
+    routed_gate, routed_up = module.routed_fc1_recompute_weights(fc1_weight_view)
+    shared_gate, shared_up, _, _ = _gate_up_weight_arguments(
+        shared_fc1, None, module.intermediate_size
+    )
+    activation_kwargs = {} if module.situ_beta is None else {"situ_beta": module.situ_beta}
+    forward_context = functional.recompute_forward_context(
+        module.mok_config,
+        workspace,
+        schedule,
+        x,
+        shared_gate,
+        shared_up,
+        routed_gate,
+        routed_up,
+        swiglu_limit=module.swiglu_limit,
+        **activation_kwargs,
+    )
+    # The packed FC1 copies are dead once the rebuild is enqueued. Dropping the last references
+    # returns their blocks to this stream's pool, where any reuse is ordered after the rebuild
+    # kernel, so MOK's backward can take the memory without record_stream.
+    del routed_gate, routed_up
+    return forward_context
+
+
 class _MoKAutograd(torch.autograd.Function):
     """Autograd bridge from MCore parameters to MoK's functional API."""
 
@@ -68,6 +124,18 @@ class _MoKAutograd(torch.autograd.Function):
     ) -> torch.Tensor:
         """Run MOK forward and retain the state needed by backward."""
         from mok import functional
+
+        # moe_mok_recompute_forward_context: release the context (the first macrobatch's routed
+        # rows, (H + 3I) * 33/32 bytes per row in MXFP8) after forward and rebuild it in backward.
+        # A call that an activation checkpoint replays during backward keeps it: its backward
+        # follows at once. Decided and validated before MOK's first EP collective, so that an
+        # unsupported layer fails on every EP rank before any of them enters MOK's barriers.
+        rebuild_forward_context = module.recompute_forward_context and not _in_autograd_backward()
+        if rebuild_forward_context and shared_output_gate_weight is not None:
+            raise RuntimeError(
+                "MOK cannot rebuild a gated forward context; disable "
+                "moe_mok_recompute_forward_context for MOK-fused gated shared experts"
+            )
 
         num_routed_parameters = len(module.autograd_routed_parameters)
         if len(parameters) != num_routed_parameters + 2:
@@ -125,7 +193,8 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.module = module
         ctx.workspace = workspace
         ctx.schedule = schedule
-        ctx.forward_context = forward_context
+        ctx.rebuild_forward_context = rebuild_forward_context
+        ctx.forward_context = None if rebuild_forward_context else forward_context
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
@@ -163,11 +232,17 @@ class _MoKAutograd(torch.autograd.Function):
                 "shared_output_gate_weight": shared_output_gate_weight,
                 "shared_output_gate_main_grad": gate_main_grad,
             }
+        if ctx.rebuild_forward_context:
+            forward_context = _rebuild_forward_context(
+                ctx.module, ctx.workspace, ctx.schedule, x, shared_fc1, fc1_weight_view
+            )
+        else:
+            forward_context = ctx.forward_context
         d_x, d_router_weights, *_ = functional.backward(
             ctx.module.mok_config,
             ctx.workspace,
             ctx.schedule,
-            ctx.forward_context,
+            forward_context,
             grad_output.contiguous(),
             x,
             router_weights,
@@ -182,6 +257,8 @@ class _MoKAutograd(torch.autograd.Function):
             main_grad_storage_tables=main_grad_storage_tables,
             **gate_kwargs,
         )
+        # MOK's backward is enqueued on this stream; the context may return to the pool.
+        del forward_context
 
         routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
         d_shared_fc1 = (

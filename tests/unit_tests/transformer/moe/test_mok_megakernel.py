@@ -402,8 +402,32 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     assert mok.is_first_microbatch
 
 
+def _unexpected_forward_context_rebuild(
+    config,
+    workspace,
+    schedule,
+    x,
+    shared_gate_weights,
+    shared_up_weights,
+    routed_gate_weights,
+    routed_up_weights,
+    swiglu_limit=None,
+    *,
+    situ_beta=None,
+):
+    """Stand-in with the signature of MOK d59188a's functional.recompute_forward_context."""
+    raise AssertionError("MOK's forward-context rebuild ran unexpectedly")
+
+
 def _mock_backend(
-    monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False, routed_only=False
+    monkeypatch,
+    *,
+    single_grouped=False,
+    gated=True,
+    mxfp8=False,
+    situ=False,
+    routed_only=False,
+    recompute_forward_context=False,
 ):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     if mxfp8:
@@ -413,6 +437,9 @@ def _mock_backend(
     package = ModuleType("mok")
     functional = ModuleType("mok.functional")
     functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    if recompute_forward_context:
+        # The adapter checks the installed MOK for the rebuild API when the option is on.
+        functional.recompute_forward_context = _unexpected_forward_context_rebuild
     package.functional = functional
     package.ops = SimpleNamespace(make_routed_d_weight_storage_table=lambda _: object())
     monkeypatch.setitem(sys.modules, "mok", package)
@@ -456,6 +483,7 @@ def _mock_backend(
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
         moe_single_grouped_weight=single_grouped,
+        moe_mok_recompute_forward_context=recompute_forward_context,
         moe_megakernel_backend_config={
             "shared_expert_mode": "native" if routed_only else "auto",
             "fwd_num_comm_sms": 32,
@@ -620,6 +648,8 @@ def test_runtime_requires_output_gate_main_grad(monkeypatch):
         module=module,
         routed_weight_views=(module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
         saved_tensors=(x, probs, shared.gate_weight, *parameters),
+        rebuild_forward_context=False,
+        forward_context=object(),
     )
     functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
     with pytest.raises(RuntimeError, match="DDP to assign param.main_grad"):

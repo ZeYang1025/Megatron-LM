@@ -1060,6 +1060,19 @@ class TransformerConfig(ModelParallelConfig):
     Remaining options, such as MOK's ``fwd_num_comm_sms``, are passed to the backend.
     """
 
+    moe_mok_recompute_forward_context: bool = False
+    """Drop MOK's saved forward context after each MoE forward and rebuild it right before that
+    layer's backward with MOK's recompute_forward_context. Without MoE-layer recompute, MOK keeps
+    FP8 copies of the first macrobatch's dispatched input, gate, up and activation output, sized
+    by macrobatch_size: (H + 3 * I) * 33 / 32 bytes per row in MXFP8, i.e. 1.61 GiB per layer and
+    microbatch for Kimi-K3 (H = latent 3584, I = 3072, macrobatch 131072). The rebuild reruns
+    only dispatch, FC1 and the activation for that macrobatch (not the router, latent
+    projections, FC2 or combine) from tensors the layer already keeps, with routed FC1 packed
+    into a transient contiguous gate/up copy. Gradients are bitwise identical. Calls that an
+    activation checkpoint replays (e.g. 'moe' in recompute_modules) keep the context, since their
+    backward follows at once. Requires moe_megakernel_backend='mok' and a MOK with
+    recompute_forward_context; MOK-fused gated shared experts are unsupported."""
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -3858,6 +3871,31 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        if self.moe_mok_recompute_forward_context:
+            if self.moe_megakernel_backend != "mok":
+                raise ValueError(
+                    "moe_mok_recompute_forward_context requires moe_megakernel_backend='mok'"
+                )
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
+            if self.moe_shared_expert_gate and megakernel_fuses_shared_expert(self):
+                raise ValueError(
+                    "moe_mok_recompute_forward_context does not support a MOK-fused gated shared "
+                    "expert: MOK's recompute_forward_context cannot recreate the gated shared "
+                    "output. Set shared_expert_mode to 'native' in moe_megakernel_backend_config."
+                )
+            if self.recompute_granularity == "full" or (
+                self.recompute_granularity == "selective"
+                and "moe" in (self.recompute_modules or [])
+            ):
+                warn_single_rank(
+                    "moe_mok_recompute_forward_context with recompute_granularity="
+                    f"{self.recompute_granularity!r} and recompute_modules="
+                    f"{self.recompute_modules}: a MoE layer whose activation recompute replays "
+                    "the MOK call keeps its forward context rather than rebuilding it, so the "
+                    "option only acts on MoE layers that are not recomputed."
+                )
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:

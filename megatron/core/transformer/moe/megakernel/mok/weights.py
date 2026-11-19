@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from megatron.core.transformer.moe.megakernel.mok import fc1_layout
+
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -410,3 +412,215 @@ def _native_split_weight_view(
         transposed_scale_tensors=tuple(column_scale_tensors),
         native_columnwise=True,
     )
+
+
+def split_rowwise_payload_ptrs(
+    params: tuple[nn.Parameter, ...], *, use_mxfp8: bool
+) -> tuple[int | None, ...]:
+    """Addresses of the per-expert rowwise payloads ``_native_split_weight_view`` reads.
+
+    Recorded when MOK's descriptor tables are built from those payloads, so that the
+    forward-context rebuild can check that it packs every expert's payload from where MOK's
+    forward read it. Only reads attributes and addresses; None marks an MXFP8 parameter without
+    native TE rowwise storage, which the view build and the rebuild both reject.
+    """
+    ptrs = []
+    for param in params:
+        storage = _parameter_storage_attr(param, "rowwise_data")
+        if storage is not None:
+            ptrs.append(storage.data_ptr())
+        else:
+            ptrs.append(None if use_mxfp8 else param.data_ptr())
+    return tuple(ptrs)
+
+
+def _split_rowwise_payload(
+    param: nn.Parameter, *, rows: int, columns: int, use_mxfp8: bool
+) -> torch.Tensor:
+    """Return one per-expert parameter's rowwise payload, read as in _native_split_weight_view."""
+    shape = (rows, columns)
+    storage = _parameter_storage_attr(param, "rowwise_data")
+    if use_mxfp8:
+        if storage is None:
+            raise RuntimeError(
+                "MOK forward-context rebuild: a split MXFP8 routed FC1 parameter has no native "
+                f"TE rowwise payload (param_type={type(param).__name__})"
+            )
+        return _storage_view(storage, shape, dtype=torch.float8_e4m3fn, name="split MXFP8 rowwise")
+    return _storage_view(
+        param if storage is None else storage,
+        shape,
+        dtype=torch.bfloat16,
+        name="split BF16 rowwise",
+    )
+
+
+def routed_fc1_expert_views(
+    fc1_weight_view,
+    fc1_parameters: tuple[nn.Parameter, ...],
+    *,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    use_mxfp8: bool,
+    single_grouped: bool,
+    descriptor_payload_ptrs: tuple[int | None, ...] | None = None,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...] | None]:
+    """Return the per-expert combined FC1 payloads and scales that MOK's forward consumed.
+
+    Payloads are zero-copy ``[2I, H]`` views (FP8 or BF16). In MXFP8 the scales are the
+    per-expert tcgen05 ``[2I / 128, H / 128, 32, 16]`` views of the cached converted scales,
+    the same bytes MOK's forward read through its descriptor tables; BF16 returns None.
+
+    Args:
+        fc1_weight_view: The routed FC1 view returned by ``quantized_routed_weights()``.
+        fc1_parameters: The MCore-owned routed FC1 parameters (one per expert when split).
+        num_experts: Local experts.
+        intermediate_size: Expert FFN size ``I``.
+        hidden_size: MoE hidden size ``H`` (the latent size for latent MoE).
+        use_mxfp8: Whether routed weights are MXFP8.
+        single_grouped: Whether routed FC1 is one single-grouped parameter.
+        descriptor_payload_ptrs: For split weights, the per-expert payload addresses that
+            ``split_rowwise_payload_ptrs`` recorded when the view's descriptor tables were built.
+            Every expert's payload must still be there. Unused for single-grouped weights, whose
+            view holds the payload itself.
+    """
+    rows = 2 * intermediate_size
+    if single_grouped:
+        if use_mxfp8:
+            row_data, row_scale = fc1_weight_view[0], fc1_weight_view[1]
+            payloads = tuple(row_data.unbind(0))
+            scales = tuple(
+                row_scale[fc1_layout.expert_scale_block_slice(expert, intermediate_size)]
+                for expert in range(num_experts)
+            )
+        else:
+            payloads = tuple(fc1_weight_view.unbind(0))
+            scales = None
+    else:
+        payloads = tuple(
+            _split_rowwise_payload(param, rows=rows, columns=hidden_size, use_mxfp8=use_mxfp8)
+            for param in fc1_parameters
+        )
+        # The forward read every expert through descriptor tables built from the payloads'
+        # addresses at the time; packing any other storage would silently rebuild a different
+        # context. Host-side checks only.
+        if descriptor_payload_ptrs is None or len(descriptor_payload_ptrs) != len(payloads):
+            raise RuntimeError(
+                "MOK forward-context rebuild needs the per-expert routed FC1 payload addresses "
+                "recorded when MOK's weight descriptors were built: got "
+                f"{None if descriptor_payload_ptrs is None else len(descriptor_payload_ptrs)} "
+                f"for {len(payloads)} experts"
+            )
+        for expert, (payload, recorded) in enumerate(zip(payloads, descriptor_payload_ptrs)):
+            if payload.data_ptr() != recorded:
+                raise RuntimeError(
+                    f"MOK forward-context rebuild: the routed FC1 payload of expert {expert} "
+                    "moved since MOK's weight descriptors were built"
+                )
+        if payloads and payloads[0].data_ptr() != fc1_weight_view.data.data_ptr():
+            raise RuntimeError(
+                "MOK forward-context rebuild: the routed FC1 payload of expert 0 is not the "
+                "representative payload of MOK's weight view"
+            )
+        scales = None
+        if use_mxfp8:
+            scales = fc1_weight_view.scale_tensors
+            if scales is None:
+                raise RuntimeError(
+                    "MOK forward-context rebuild needs the split MXFP8 weight view to retain "
+                    "its per-expert tcgen05 scale tensors"
+                )
+    if len(payloads) != num_experts or (scales is not None and len(scales) != num_experts):
+        raise RuntimeError(
+            "MOK forward-context rebuild expert count mismatch: "
+            f"expected {num_experts}, got {len(payloads)} payloads and "
+            f"{None if scales is None else len(scales)} scales"
+        )
+    return payloads, scales
+
+
+@torch.no_grad()
+def pack_fc1_gate_up(
+    expert_payloads, expert_scales, intermediate_size: int
+) -> tuple[object, object]:
+    """Pack combined ``[2I, H]`` FC1 experts into the contiguous gate/up MOK's rebuild accepts.
+
+    ``mok.functional.recompute_forward_context`` rejects split (descriptor-backed) and combined
+    FC1 weights; it takes gate and up as separate single-grouped tensors. This copies gate rows
+    ``[0, I)`` and up rows ``[I, 2I)`` of every expert into ``[E, I, H]`` tensors and, in MXFP8,
+    the matching 128-row scale blocks into ``[E * I / 128, H / 128, 32, 16]`` tensors (see
+    ``fc1_layout``). Only bytes move, so the packed weights equal what MOK's forward read.
+
+    The copies are fresh allocations on the current stream. Callers release them right after the
+    rebuild is enqueued on that stream; later same-stream allocations are ordered after it.
+
+    Args:
+        expert_payloads: Per-expert contiguous ``[2I, H]`` FP8 or BF16 payloads.
+        expert_scales: Per-expert tcgen05 ``[2I / 128, H / 128, 32, 16]`` uint8 scales for MXFP8,
+            or None for BF16.
+        intermediate_size: Expert FFN size ``I``.
+
+    Returns:
+        ``(gate, up)``: BF16 ``[E, I, H]`` tensors, or MXFP8 ``(data, scale)`` pairs.
+    """
+    if not expert_payloads:
+        raise ValueError("MOK FC1 packing needs at least one expert payload")
+    first = expert_payloads[0]
+    rows = 2 * intermediate_size
+    if first.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise TypeError(f"MOK FC1 packing supports FP8 E4M3 or BF16 payloads, got {first.dtype}")
+    for payload in expert_payloads:
+        if (
+            payload.ndim != 2
+            or payload.shape[0] != rows
+            or payload.shape != first.shape
+            or payload.dtype != first.dtype
+            or payload.device != first.device
+            or not payload.is_contiguous()
+        ):
+            raise ValueError(
+                "MOK FC1 packing needs contiguous same-shape [2I, H] expert payloads with "
+                f"2I={rows}, got shape={tuple(payload.shape)}, dtype={payload.dtype}"
+            )
+    is_mxfp8 = first.dtype == torch.float8_e4m3fn
+    if is_mxfp8 != (expert_scales is not None):
+        raise ValueError("MOK FC1 packing needs scales exactly for MXFP8 payloads")
+
+    gate_rows, up_rows = fc1_layout.gate_up_row_slices(intermediate_size)
+    # torch.stack only moves bytes; an FP8 payload is stacked through its uint8 view.
+    sources = (
+        [payload.view(torch.uint8) for payload in expert_payloads]
+        if is_mxfp8
+        else list(expert_payloads)
+    )
+    gate = torch.stack([source[gate_rows] for source in sources])
+    up = torch.stack([source[up_rows] for source in sources])
+    if not is_mxfp8:
+        return gate, up
+
+    gate = gate.view(torch.float8_e4m3fn)
+    up = up.view(torch.float8_e4m3fn)
+    _, scale_shape = fc1_layout.packed_gate_up_shapes(
+        1, intermediate_size, first.shape[1], mxfp8=True
+    )
+    expert_scale_shape = (2 * scale_shape[0],) + scale_shape[1:]
+    if len(expert_scales) != len(expert_payloads):
+        raise ValueError(
+            f"MOK FC1 packing got {len(expert_payloads)} payloads but {len(expert_scales)} scales"
+        )
+    for scale in expert_scales:
+        if (
+            tuple(scale.shape) != expert_scale_shape
+            or scale.dtype != torch.uint8
+            or scale.device != first.device
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(
+                "MOK FC1 packing needs contiguous uint8 tcgen05 expert scales shaped "
+                f"{expert_scale_shape}, got shape={tuple(scale.shape)}, dtype={scale.dtype}"
+            )
+    gate_blocks, up_blocks = fc1_layout.gate_up_scale_block_slices(intermediate_size)
+    gate_scale = torch.cat([scale[gate_blocks] for scale in expert_scales])
+    up_scale = torch.cat([scale[up_blocks] for scale in expert_scales])
+    return (gate, gate_scale), (up, up_scale)
