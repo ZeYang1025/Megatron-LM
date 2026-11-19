@@ -1332,6 +1332,26 @@ def _backfill_gtp_sharded_param_map(
         id_to_sharded_param_map[param_id] = rebuilt[key]
 
 
+def _masters_use_optimizer_companions(model_sharded_state_dict, float16_groups) -> bool:
+    """Whether the optimizer state of any float16 param is built by an optimizer companion.
+
+    A companion (``ShardedTensorFactory.optimizer_factory``, e.g. GTP local fragments, see
+    ``dist_checkpointing.gtp``) is bound to the live parameter and replaces the model factory
+    for that parameter's optimizer state.
+    """
+    from ..dist_checkpointing.dict_utils import nested_values
+    from ..dist_checkpointing.mapping import ShardedTensorFactory
+
+    companion_param_ids = {
+        id(entry.optimizer_factory.data)
+        for entry in nested_values(model_sharded_state_dict)
+        if isinstance(entry, ShardedTensorFactory) and entry.optimizer_factory is not None
+    }
+    return bool(companion_param_ids) and any(
+        id(param) in companion_param_ids for group in float16_groups for param in group
+    )
+
+
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
@@ -1648,9 +1668,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # layers. An empty list would be saved as common state, which only rank 0 writes and
         # every rank loads, and splitting a list into sharded and common values drops element
         # positions, so a list mixing empty and populated groups cannot be merged back on load.
+        master_groups = state_dict['fp32_from_fp16_params']
+        if _masters_use_optimizer_companions(model_sharded_state_dict, self.float16_groups):
+            # For the same reason, key the masters within each group by parameter index when
+            # some are built by an optimizer companion (GTP local fragments): those builds
+            # carry local-only layout objects, which load preprocessing moves out of a list
+            # without their positions.
+            master_groups = [dict(enumerate(group)) for group in master_groups]
         state_dict['fp32_from_fp16_params'] = {
             group_index: group if group else LocalNonpersistentObject(group)
-            for group_index, group in enumerate(state_dict['fp32_from_fp16_params'])
+            for group_index, group in enumerate(master_groups)
         }
 
         step = self._extract_common_per_param_step(state_dict['optimizer'])
@@ -1714,6 +1741,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for group_index, (current_group, saved_group) in enumerate(
             zip(self.fp32_from_float16_groups, saved_groups)
         ):
+            if isinstance(saved_group, dict):
+                # Sharded checkpoints with optimizer companions key the masters by parameter
+                # index as well; see ``sharded_state_dict``.
+                if set(saved_group) != set(range(len(current_group))):
+                    raise ValueError(
+                        f'Checkpoint FP32 main params of optimizer param group {group_index} '
+                        f'are indexed {list(saved_group)}, but the group has '
+                        f'{len(current_group)} float16 params.'
+                    )
+                saved_group = [saved_group[index] for index in range(len(current_group))]
             if len(saved_group) == len(current_group):
                 for current_param, saved_param in zip(current_group, saved_group):
                     current_param.data.copy_(saved_param.data)
