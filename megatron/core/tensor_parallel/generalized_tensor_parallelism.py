@@ -412,6 +412,40 @@ def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
     _wgrad_buf_pool[key].append(buf)
 
 
+# Cap on the transient scratch that one column chunk of the opt-in FP32-accumulating wgrad
+# reduction holds (GTPShardedParam._reduce_wgrads_with_fp32_accumulation): the all-to-all send
+# and receive buffers at the wgrad dtype plus the FP32 shard sum. The scratch comes from the
+# caching allocator and is dropped on return; nothing joins the persistent GTP pools. Read at
+# call time, so tests can shrink it to exercise several chunks.
+_FP32_WGRAD_REDUCTION_CHUNK_BYTES = 512 * 1024**2
+
+
+def _fp32_wgrad_reduction_column_chunks(num_cols: int, bytes_per_col: int, max_chunk_bytes: int):
+    """Split ``[0, num_cols)`` into contiguous, near-equal column ranges under a byte cap.
+
+    A range holds at most ``max(1, max_chunk_bytes // bytes_per_col)`` columns (one column is
+    always allowed, even if it alone exceeds the cap). Widths differ by at most one, so the last
+    chunk is never a sliver. Pure index arithmetic, no torch.
+
+    Returns:
+        ``(start, end)`` pairs in increasing order that cover every column exactly once.
+    """
+    if num_cols <= 0:
+        return []
+    if bytes_per_col <= 0:
+        raise ValueError(f"bytes_per_col must be positive, got {bytes_per_col}")
+    max_cols = max(1, max_chunk_bytes // bytes_per_col)
+    num_chunks = -(-num_cols // max_cols)
+    base, extra = divmod(num_cols, num_chunks)
+    chunks = []
+    start = 0
+    for index in range(num_chunks):
+        end = start + base + (1 if index < extra else 0)
+        chunks.append((start, end))
+        start = end
+    return chunks
+
+
 class _GTPCompositeWorkHandle:
     """Waits on several collective handles as one, so GTPShardHandle still sees one handle."""
 
@@ -1094,6 +1128,10 @@ def _init_gtp_runtime_attrs(obj):
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
     obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
+    # Opt-in FP32-accumulating reduction of a BF16/FP16 wgrad, set by the owning module (the
+    # embedding, from TransformerConfig.gtp_embedding_wgrad_fp32). See
+    # GTPShardedParam._reduce_wgrads_with_fp32_accumulation.
+    obj._wgrad_reduce_in_fp32 = False
     # Symmetric wgrad slot
     obj._wgrad_symm_slot = None
     # Padding
@@ -1395,9 +1433,11 @@ class GTPShardedParam(torch.nn.Parameter):
             # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
             # parity alternates consecutive blocks between two buffers.
             key = key + (self.chain_id, self._double_buffer_parity())
-        elif getattr(self, "_buf_parity", None):
+        elif not reduce_scatter and getattr(self, "_buf_parity", None):
             # Set by _ensure_no_shared_buffer_with. Parity 0 keeps the shared buffer, so
             # only the second weight of an adjacent same-key pair costs an extra allocation.
+            # Gather buffers only: an eager RS output is owned by one ticket at a time (see
+            # release), so adjacent reduce-scatters cannot collide.
             key = key + (self._buf_parity,)
         if recompute:
             # Two components, guarding two different collisions:
@@ -2181,9 +2221,134 @@ class GTPShardedParam(torch.nn.Parameter):
         counts gtp_remat peers' tokens) normalizes instead — there the gtp_remat axis must SUM
         like the DP axis (a 1/gtp_remat mean would shrink every gtp_remat grad).
         """
+        scale = self._mean_rs_scale()
+        if scale != 1.0:
+            torch._foreach_mul_(list(wgrads), scale)
+
+    def _mean_rs_scale(self) -> float:
+        """The factor that turns the gtp_remat SUM into the gtp_remat mean, 1.0 when the axis
+        must SUM instead (see _prescale_wgrads_for_mean_rs for the rule)."""
         gtp_remat_size = self.group.size()
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
-            torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
+            return 1.0 / gtp_remat_size
+        return 1.0
+
+    def _uses_fp32_wgrad_reduction(self, wgrads) -> bool:
+        """Whether this backward takes the opt-in FP32-accumulating wgrad reduction.
+
+        Opt-in per weight (``_wgrad_reduce_in_fp32``, set on the GTP embedding by
+        ``TransformerConfig.gtp_embedding_wgrad_fp32``), and only for a BF16/FP16 wgrad: an FP32
+        wgrad already sums in FP32 on the ordinary reduce-scatter.
+        """
+        return (
+            getattr(self, "_wgrad_reduce_in_fp32", False)
+            and self.group.size() > 1
+            and all(w.dtype in (torch.bfloat16, torch.float16) for w in wgrads)
+        )
+
+    def _reduce_wgrads_with_fp32_accumulation(self, wgrads, nvtx_label=None):
+        """Reduce-scatter BF16/FP16 wgrads into main_grad with FP32 accumulation, synchronously.
+
+        The ordinary path scales a low-precision wgrad and ring-reduce-scatters it in that
+        dtype, rounding every partial sum, before ``main_grad.add_``. Here, per column chunk of
+        the [rows, cols] wgrad: copy the chunk into a contiguous send buffer (pad rows zeroed),
+        all-to-all it at the wgrad dtype over the gtp_remat group (each rank receives every
+        peer's rows of its own shard: the bytes of a ring reduce-scatter), sum the peers'
+        contributions in FP32 and add them, with the usual gtp_remat mean scale, into the same
+        ``main_grad`` columns. This is ``reduce_scatter_with_fp32_accumulation`` with its final
+        copy fused into the accumulation, so the wgrad is never rounded again after autograd
+        produced it.
+
+        The chunk scratch (send + receive at the wgrad dtype, plus the FP32 shard sum) is
+        capped by ``_FP32_WGRAD_REDUCTION_CHUNK_BYTES``, comes from the caching allocator and is
+        dropped on return: no persistent buffer. Runs on the current stream and is complete on
+        return, like the chain-head sync path, so it leaves no handle for the cascade.
+
+        Returns:
+            The per-weight placeholder grads from ``_handle_megatron_grad_accum``.
+        """
+        if nvtx_label is None:
+            nvtx_label = self._debug_name + ".bwd.sync"
+        weights = self._weights
+        group = self.group
+        world_size = group.size()
+        scale = self._mean_rs_scale()
+        if GTP_CONFIG.check_param_states:
+            for w in weights:
+                w._set_rs_state(GTPWeightState.DATA_READY_SYNC)
+
+        nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32_chunked")
+        for weight, wgrad in zip(weights, wgrads):
+            # Symmetric slots come from get_wgrad_tensor, which only TE-produced (main_grad-dtype)
+            # wgrads use; this path never consumes them, so one pending here would leak.
+            if getattr(weight, "_wgrad_symm_slot", None) is not None:
+                raise RuntimeError(
+                    "[GTP] FP32-accumulating wgrad reduction does not consume symmetric-memory "
+                    f"wgrad slots, but one is pending for {weight._debug_name}."
+                )
+            main_grad = weight.main_grad
+            rows_padded = weight._unsharded_shape_padded[0]
+            shard_rows = rows_padded // world_size
+            num_rows = wgrad.shape[0]
+            num_cols = wgrad.shape[1] if wgrad.dim() == 2 else -1
+            if (
+                wgrad.dim() != 2
+                or num_rows > rows_padded
+                or tuple(main_grad.shape) != (shard_rows, num_cols)
+            ):
+                raise RuntimeError(
+                    f"[GTP] FP32-accumulating wgrad reduction expects a 2-D wgrad of at most "
+                    f"{rows_padded} rows reducing into a [{shard_rows}, cols] main_grad; got wgrad "
+                    f"{tuple(wgrad.shape)} and main_grad {tuple(main_grad.shape)} for "
+                    f"{weight._debug_name}."
+                )
+            # Per column: send + receive at the wgrad dtype for every padded row, plus the FP32
+            # sum of this rank's shard rows.
+            bytes_per_col = rows_padded * 2 * wgrad.element_size() + shard_rows * 4
+            chunks = _fp32_wgrad_reduction_column_chunks(
+                num_cols, bytes_per_col, _FP32_WGRAD_REDUCTION_CHUNK_BYTES
+            )
+            if not chunks:
+                continue
+            max_width = max(end - start for start, end in chunks)
+            # Exactly the three buffers bytes_per_col budgets, sized for the widest chunk and
+            # reused by every chunk. The FP32 sum is written in place too: a fresh one per chunk
+            # would be allocated while the previous chunk's sum is still referenced, so two would
+            # be live at once and the scratch would exceed the cap by one shard sum.
+            send_flat = torch.empty(rows_padded * max_width, dtype=wgrad.dtype, device=wgrad.device)
+            recv_flat = torch.empty_like(send_flat)
+            sum_flat = torch.empty(shard_rows * max_width, dtype=torch.float32, device=wgrad.device)
+            for start, end in chunks:
+                width = end - start
+                # Flat prefixes keep a narrower last chunk contiguous, as the collective needs.
+                send = send_flat[: rows_padded * width].view(rows_padded, width)
+                recv = recv_flat[: rows_padded * width].view(rows_padded, width)
+                shard_sum = sum_flat[: shard_rows * width].view(shard_rows, width)
+                send[:num_rows].copy_(wgrad[:, start:end])
+                if rows_padded > num_rows:
+                    send[num_rows:].zero_()
+                # Rank r sends rows [s*shard_rows, (s+1)*shard_rows) to rank s and receives its
+                # own shard rows from every peer, stacked by source rank. A synchronous
+                # collective orders the current stream after it, so the next chunk's copy
+                # cannot overwrite a send buffer the all-to-all still reads.
+                torch.distributed.all_to_all_single(recv, send, group=group)
+                # Reads the BF16/FP16 rows and accumulates in FP32 (no upcast copy of recv).
+                torch.sum(
+                    recv.view(world_size, shard_rows, width),
+                    dim=0,
+                    dtype=torch.float32,
+                    out=shard_sum,
+                )
+                main_grad[:, start:end].add_(shard_sum, alpha=scale)
+        nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32_chunked")
+
+        result = [self._handle_megatron_grad_accum(p) for p in weights]
+        # Complete on return: hand the inputs to the shared release path, as the sync path does
+        # (a no-op for autograd's own wgrad, which never came from a GTP pool).
+        self._wgrad_input_bufs = list(wgrads)
+        self.rs_event.record()
+        self._release_wgrad_scratch(ready_event=self.rs_event)
+        return result
 
     def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
@@ -2438,7 +2603,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
         if async_op is None:
             async_op = GTP_CONFIG.async_reduction and self.prev_w is not None
-        if async_op:
+        if self._uses_fp32_wgrad_reduction(wgrads):
+            # Opt-in FP32 accumulation (gtp_embedding_wgrad_fp32). Always synchronous, even
+            # where the RS would be async: it accumulates into main_grad and fires grad-ready
+            # before returning, so it leaves no handle, and the cascade's drain of this weight
+            # finds nothing in flight.
+            result = self._reduce_wgrads_with_fp32_accumulation(wgrads, nvtx_label)
+            ret = result if batched else result[0]
+        elif async_op:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle, release_bufs = self._reduce_scatter(
@@ -2765,7 +2937,8 @@ class GTPWeightCache:
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
         Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays.
+        so every CUDA-graph ticket retains a stable address across replays. Other tickets keep
+        ``slot.buf`` too, except eager reduce-scatter outputs (see below).
         """
         slot = self._slots[ticket]
         if slot.buf is None:
@@ -2778,6 +2951,12 @@ class GTPWeightCache:
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
+        if slot.reduce_scatter:
+            # Returning an eager RS output to the pool relinquishes this ticket's ownership.
+            # Clear its reference so the next get() must check out a buffer again. Otherwise,
+            # another ticket can acquire this buffer and leave an RS result pending, while
+            # this ticket reuses its stale reference and overwrites that result.
+            slot.buf = None
 
     def clear(self):
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""

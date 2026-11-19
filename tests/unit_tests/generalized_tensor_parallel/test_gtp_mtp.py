@@ -19,6 +19,9 @@ Only the third ever raised. The other two just train on wrong numbers, hence the
 accounting guards below rather than smoke tests.
 """
 
+import collections
+import contextlib
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -46,6 +49,8 @@ SEQ = 16
 BATCH = 2
 NUM_EXPERTS = 4
 dtype = torch.bfloat16
+# The weight MTP shares with the main model and gtp_embedding_wgrad_fp32 acts on.
+EMBEDDING_WEIGHT = "embedding.word_embeddings.weight"
 
 
 def _expert_parallel_kwargs(moe, world_size):
@@ -55,12 +60,21 @@ def _expert_parallel_kwargs(moe, world_size):
     return dict(expert_model_parallel_size=2, expert_gtp_remat_size=world_size // 2)
 
 
-def _build_mtp_gpt_model(repeated_layer=False, moe=False):
+def _build_mtp_gpt_model(
+    repeated_layer=False,
+    moe=False,
+    kv_channels=HIDDEN // NUM_HEADS,
+    ffn_hidden_size=FFN_HIDDEN,
+    embedding_wgrad_fp32=False,
+):
     """Full GPTModel (embedding + decoder + output_layer) with an MTP block attached.
 
     ``moe=True`` puts grouped experts in both the decoder and the MTP layer, which is what puts
     weights on the ``GTP_remat_grouped_fc1/fc2`` chains -- a separate code path from the dense
     chain, with its own one-block-ahead prefetch and double buffering.
+
+    ``embedding_wgrad_fp32`` sets ``gtp_embedding_wgrad_fp32``: the shared embedding then reduces
+    its gradient with the synchronous FP32 path on every consume.
     """
     from megatron.core.models.gpt import GPTModel
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -86,8 +100,8 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         num_layers=NUM_LAYERS,
         hidden_size=HIDDEN,
         num_attention_heads=NUM_HEADS,
-        kv_channels=HIDDEN // NUM_HEADS,
-        ffn_hidden_size=FFN_HIDDEN,
+        kv_channels=kv_channels,
+        ffn_hidden_size=ffn_hidden_size,
         use_cpu_initialization=False,
         params_dtype=dtype,
         bf16=True,
@@ -102,6 +116,7 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         mtp_num_layers=MTP_NUM_LAYERS,
         mtp_use_repeated_layer=repeated_layer,
         mtp_loss_scaling_factor=0.1,
+        gtp_embedding_wgrad_fp32=embedding_wgrad_fp32,
         **moe_kwargs,
     )
     spec = get_gpt_layer_with_transformer_engine_spec(
@@ -202,7 +217,63 @@ def _assert_grouped_chains_used(model, moe):
         assert not grouped_mtp, f"dense variant unexpectedly used grouped chains: {grouped_mtp}"
 
 
-def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, moe=False):
+def _assert_eh_proj_shares_rs_key_with_attention_proj(model):
+    """The MTP eh_proj and attention output projection draw RS outputs from one cache key, so
+    the shapes test keeps exercising the buffer collision it guards against."""
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import get_global_GTP_cache
+
+    params = dict(model.named_parameters())
+    eh_proj = [p for n, p in params.items() if n.startswith("mtp.") and "eh_proj" in n]
+    proj = [
+        p for n, p in params.items() if n.startswith("mtp.") and "self_attention.linear_proj" in n
+    ]
+    assert len(eh_proj) == 1 and len(proj) == 1, (sorted(params), eh_proj, proj)
+    slots = get_global_GTP_cache()._slots
+    keys = [slots[p._rs_ticket].key for p in (eh_proj[0], proj[0])]
+    assert keys[0] == keys[1], f"eh_proj and linear_proj RS cache keys differ: {keys}"
+
+
+@contextlib.contextmanager
+def _recording_fp32_wgrad_reductions():
+    """Record the opt-in FP32 wgrad reduction (gtp_embedding_wgrad_fp32) while active.
+
+    Yields ``(calls, local_sums)``, keyed by parameter name: how many times each weight took the
+    path, and the FP32 sum of the local wgrads (before any reduction) it was handed. The mean of
+    those sums over the GTP group is what the weight's main_grad must end up holding.
+    """
+    original = GTPShardedParam._reduce_wgrads_with_fp32_accumulation
+    calls, local_sums = collections.Counter(), {}
+
+    def recording(self, wgrads, *args, **kwargs):
+        for weight, wgrad in zip(self._weights, wgrads):
+            calls[weight._debug_name] += 1
+            local = wgrad.detach().to(torch.float32, copy=True)
+            if weight._debug_name in local_sums:
+                local_sums[weight._debug_name].add_(local)
+            else:
+                local_sums[weight._debug_name] = local
+        return original(self, wgrads, *args, **kwargs)
+
+    GTPShardedParam._reduce_wgrads_with_fp32_accumulation = recording
+    try:
+        yield calls, local_sums
+    finally:
+        GTPShardedParam._reduce_wgrads_with_fp32_accumulation = original
+
+
+def _fp32_mean_over_gtp(local_sum):
+    """FP32 all-reduce mean of a local wgrad sum over the dense GTP group, on the CPU."""
+    from megatron.core import parallel_state as ps
+
+    group = ps.get_gtp_weight_remat_group()
+    total = local_sum.clone()
+    dist.all_reduce(total, group=group)
+    return (total / group.size()).cpu()
+
+
+def _worker_shared_weight_grads(
+    rank, world_size, port, repeated_layer=False, moe=False, shapes=None, embedding_wgrad_fp32=False
+):
     """Async reduce-scatter path must produce the same gradients as the sync path, with MTP.
 
     Both phases run the SAME model, sharding (gtp_remat=world), init weights and batch -- only
@@ -210,6 +281,13 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
     on every wgrad, so it has no deferred cascade and no repeated-backward hazard; it is a
     trusted reference for exactly the code the async path adds. Holding the sharding identical
     on both sides also keeps every DP/GTP grad-scaling subtlety out of the comparison.
+
+    ``embedding_wgrad_fp32`` sets gtp_embedding_wgrad_fp32 in both phases. The shared embedding
+    then reduces synchronously in FP32 on every consume, in the middle of the async chain, so the
+    comparison also covers the cascade around that path. In each phase the embedding must take
+    the path once per consume, and its main_grad must be the FP32 mean over the GTP group of the
+    local wgrads it was handed. A third, flag-off sync phase then checks that the flag changes no
+    other weight's gradient. Without the flag the path must never run.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
@@ -219,11 +297,15 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
     saved_async = GTP_CONFIG.async_reduction
     saved_pad = GTP_CONFIG.pad_for_alignment
     grads, losses = {}, {}
+    fp32_calls, expected_fp32_calls, fp32_references = {}, {}, {}
+    phases = [("sync_ref", False, embedding_wgrad_fp32), ("async", True, embedding_wgrad_fp32)]
+    if embedding_wgrad_fp32:
+        phases.append(("sync_flag_off", False, False))
     try:
         # pad_for_alignment=0 keeps each shard exactly 1/gtp of the full weight, so the
         # all-gather in _gathered_main_grads reconstructs the unsharded gradient directly.
         GTP_CONFIG.pad_for_alignment = 0
-        for phase, use_async in (("sync_ref", False), ("async", True)):
+        for phase, use_async, phase_embedding_wgrad_fp32 in phases:
             ps.destroy_model_parallel()
             ps.initialize_model_parallel(
                 tensor_model_parallel_size=1,
@@ -235,7 +317,12 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             torch.manual_seed(42)
             GTP_CONFIG.async_reduction = use_async
 
-            model = _build_mtp_gpt_model(repeated_layer, moe)
+            model = _build_mtp_gpt_model(
+                repeated_layer,
+                moe,
+                embedding_wgrad_fp32=phase_embedding_wgrad_fp32,
+                **(shapes or {}),
+            )
             classify_gtp_remat_chains([model])
             shared = [
                 n
@@ -249,8 +336,19 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             )
             _assert_grouped_chains_used(model, moe)
 
-            losses[phase] = _forward_backward(model)
+            with _recording_fp32_wgrad_reductions() as (calls, local_sums):
+                losses[phase] = _forward_backward(model)
             grads[phase] = _gathered_main_grads(model)
+            fp32_calls[phase] = dict(calls)
+            # One FP32 reduction per embedding consume (the main lookup plus one per MTP depth)
+            # with the flag, none without it.
+            expected_fp32_calls[phase] = (
+                {EMBEDDING_WEIGHT: 1 + MTP_NUM_LAYERS} if phase_embedding_wgrad_fp32 else {}
+            )
+            if phase_embedding_wgrad_fp32 and EMBEDDING_WEIGHT in local_sums:
+                fp32_references[phase] = _fp32_mean_over_gtp(local_sums[EMBEDDING_WEIGHT])
+            if shapes is not None and use_async:
+                _assert_eh_proj_shares_rs_key_with_attention_proj(model)
 
             del model
             ps.destroy_model_parallel()
@@ -261,6 +359,13 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
         GTP_CONFIG.async_reduction = saved_async
         GTP_CONFIG.pad_for_alignment = saved_pad
 
+    # Rank-local counts, so every rank checks them.
+    for phase, phase_calls in fp32_calls.items():
+        assert phase_calls == expected_fp32_calls[phase], (
+            f"{phase}: FP32 embedding wgrad reductions per weight {phase_calls}, expected "
+            f"{expected_fp32_calls[phase]}"
+        )
+
     if rank != 0:
         return
 
@@ -269,6 +374,28 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
     torch.testing.assert_close(
         torch.tensor(losses["async"]), torch.tensor(losses["sync_ref"]), atol=1e-2, rtol=1e-2
     )
+    for phase, reference in fp32_references.items():
+        # The same BF16 values summed in FP32 in another order (consumes, then ranks) differ by a
+        # few ulps. Reduce-scattering them in BF16, or dropping a consume, misses by far more.
+        torch.testing.assert_close(
+            grads[phase][EMBEDDING_WEIGHT],
+            reference,
+            rtol=1e-5,
+            atol=1e-5 * reference.abs().max().item(),
+            msg=lambda m, phase=phase: f"{phase}: embedding main_grad is not the FP32 mean. {m}",
+        )
+    if "sync_flag_off" in grads:
+        # The flag only changes how the embedding's own gradient is reduced.
+        flag_off = grads["sync_flag_off"]
+        assert set(flag_off) == set(test), "param sets differ between flag-on and flag-off runs"
+        for name, off_grad in flag_off.items():
+            if name == EMBEDDING_WEIGHT:
+                continue
+            rel = (off_grad - test[name]).abs().max().item() / (off_grad.abs().max().item() + 1e-8)
+            assert rel < 1e-4, (
+                f"{name}: gtp_embedding_wgrad_fp32 changed a non-embedding gradient (max rel err "
+                f"{rel:.3e} between the flag-on async run and the flag-off sync run)"
+            )
 
     max_err, worst = 0.0, None
     for name in ref:
@@ -286,7 +413,7 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             max_err, worst = rel, name
     print(f"[mtp-shared] max relative grad error async-vs-sync = {max_err:.3e} (worst: {worst})")
 
-    assert max_err < 2e-2, (
+    assert max_err < 1e-4, (
         f"MTP shared-weight gradient mismatch between the async and sync GTP reduce-scatter "
         f"paths (max rel err {max_err:.3e} on {worst}). A weight consumed more than once per "
         f"forward had one of its wgrad reduce-scatters dropped or overwritten."
@@ -598,7 +725,9 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
     )
 
 
-def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, accumulate=False):
+def _worker_ddp_grad_ready_counts(
+    rank, world_size, port, repeated_layer=False, accumulate=False, embedding_wgrad_fp32=False
+):
     """A weight consumed N times per forward fires DDP grad-ready N times, not once.
 
     Each consume finalizes the previous reduce-scatter, and every finalize calls the param's
@@ -610,9 +739,11 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, 
     asserts overlap_grad_reduce, and the golden gate is first evaluated on batch 2, hence three
     iterations. A desynchronized count makes finish_grad_sync raise, so completing the loop is
     itself an assertion.
-    """
-    import collections
 
+    ``embedding_wgrad_fp32`` sets gtp_embedding_wgrad_fp32: the embedding then fires grad-ready
+    from the synchronous FP32 reduction, which must keep the same count, and must take that path
+    on every consume of every iteration.
+    """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.distributed import param_and_grad_buffer as pgb
@@ -634,7 +765,9 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, 
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
 
-        model = _build_mtp_gpt_model(repeated_layer=repeated_layer, moe=False)
+        model = _build_mtp_gpt_model(
+            repeated_layer=repeated_layer, moe=False, embedding_wgrad_fp32=embedding_wgrad_fp32
+        )
         classify_gtp_remat_chains([model])
         if not accumulate:
             for p in model.parameters():
@@ -668,18 +801,21 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, 
         labels = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
 
         # 3 iterations: batch 1 records golden, batches 2 and 3 are compared against it.
-        per_iter = []
-        for _ in range(3):
-            counts.clear()
-            ddp.zero_grad_buffer()
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                loss = ddp(input_ids, position_ids, attention_mask=None, labels=labels).mean()
-            loss.backward()
-            # Production order: fence, then finish_grad_sync.
-            wait_for_gtp_grad_reduction_on_current_stream()
-            ddp.finish_grad_sync()  # raises if a bucket never reached its golden count
-            torch.cuda.synchronize()
-            per_iter.append(dict(counts))
+        per_iter, fp32_per_iter = [], []
+        with _recording_fp32_wgrad_reductions() as (fp32_calls, _):
+            for _ in range(3):
+                counts.clear()
+                fp32_calls.clear()
+                ddp.zero_grad_buffer()
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    loss = ddp(input_ids, position_ids, attention_mask=None, labels=labels).mean()
+                loss.backward()
+                # Production order: fence, then finish_grad_sync.
+                wait_for_gtp_grad_reduction_on_current_stream()
+                ddp.finish_grad_sync()  # raises if a bucket never reached its golden count
+                torch.cuda.synchronize()
+                per_iter.append(dict(counts))
+                fp32_per_iter.append(dict(fp32_calls))
 
         del model, ddp
         ps.destroy_model_parallel()
@@ -689,6 +825,13 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, 
     finally:
         pgb._ParamAndGradBucketGroup.register_grad_ready = orig_register
         GTP_CONFIG.pad_for_alignment = saved_pad
+
+    # Rank-local, so every rank checks: with the flag the embedding reduces in FP32 on every
+    # consume of every iteration; without it the path never runs.
+    expected_fp32 = {EMBEDDING_WEIGHT: 1 + MTP_NUM_LAYERS} if embedding_wgrad_fp32 else {}
+    assert all(
+        it == expected_fp32 for it in fp32_per_iter
+    ), f"FP32 embedding wgrad reductions per iteration {fp32_per_iter}, expected {expected_fp32}"
 
     if rank != 0:
         return
@@ -854,6 +997,32 @@ class TestGTPMTP:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
 
+    def test_mtp_grads_match_sync_when_eh_proj_shares_rs_buffer(self):
+        """eh_proj and the MTP attention output projection with one shape share an RS buffer key.
+
+        That needs num_heads * kv_channels == 2 * hidden (asserted on the RS cache keys), and an FFN
+        width unlike eh_proj's so no buffer parity separates eh_proj from its chain predecessor. eh_proj's
+        depth-2 reduce-scatter stays pending across the whole depth-1 block, so the projection's
+        depth-1 reduce-scatter must not write into that pending output.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        shapes = dict(kv_channels=2 * HIDDEN // NUM_HEADS, ffn_hidden_size=3 * HIDDEN)
+        _run_distributed(_worker_shared_weight_grads, 4, True, False, shapes)
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_mtp_shared_weight_grads_with_fp32_embedding_wgrad(self, repeated_layer):
+        """gtp_embedding_wgrad_fp32 under MTP: the shared embedding reduces synchronously in FP32
+        on each of its consumes, between async reduce-scatters of its chain neighbours.
+
+        The async run must still match the sync run on every weight (the cascade around the FP32
+        path neither drops nor double-adds a neighbour's gradient), and the embedding's main_grad
+        must be the FP32 mean of its local wgrads in both runs.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, False, None, True)
+
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_repeated_consume_gets_its_own_all_gather(self, repeated_layer, moe):
@@ -885,6 +1054,15 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_ddp_grad_ready_counts, 4, repeated_layer)
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_mtp_ddp_grad_ready_counts_with_fp32_embedding_wgrad(self, repeated_layer):
+        """With gtp_embedding_wgrad_fp32 and FP32 main grads (K3's setup), the embedding fires
+        DDP grad-ready from the FP32 path once per consume, as stably as before, and DDP's
+        finish_grad_sync still completes every bucket."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_ddp_grad_ready_counts, 4, repeated_layer, True, True)
 
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_mtp_dummy_wgrad_does_not_leak_into_grad(self, repeated_layer):

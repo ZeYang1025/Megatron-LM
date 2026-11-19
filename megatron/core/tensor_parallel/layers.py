@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -440,6 +441,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
 
         self.gtp_remat_size = 1
+        gtp_embedding_wgrad_fp32 = bool(getattr(config, "gtp_embedding_wgrad_fp32", False))
         gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
@@ -455,6 +457,26 @@ class VocabParallelEmbedding(torch.nn.Module):
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
             # via GTPEmbeddingWeight.backward.
             self.weight._need_weight_prefetch = False
+            # The lookup's autograd wgrad arrives in the param dtype, so by default it is
+            # reduce-scattered in BF16 even with FP32 main grads. Opt in to FP32 accumulation.
+            self.weight._wgrad_reduce_in_fp32 = gtp_embedding_wgrad_fp32
+        if gtp_embedding_wgrad_fp32:
+            # Checked here, not in TransformerConfig: only this module knows whether the
+            # embedding is GTP-sharded (the GTP group comes from pg_collection / the MPU), and
+            # these are the cases GTPShardedParam._uses_fp32_wgrad_reduction then skips.
+            if self.gtp_remat_size <= 1:
+                warn_single_rank(
+                    "gtp_embedding_wgrad_fp32 has no effect: the embedding is not GTP-sharded "
+                    "(dense GTP is off: tensor_parallel_num_weight_shards equals "
+                    "tensor_model_parallel_size), so its gradient is never reduce-scattered over "
+                    "a GTP group."
+                )
+            elif self.weight.dtype not in (torch.bfloat16, torch.float16):
+                warn_single_rank(
+                    f"gtp_embedding_wgrad_fp32 has no effect with {self.weight.dtype} embedding "
+                    "weights: the GTP reduce-scatter of their gradient already accumulates in "
+                    "that precision."
+                )
 
     def _fuse_wgrad_accumulation(self, weight: torch.Tensor) -> bool:
         """Whether the backward adds the weight gradient into ``main_grad`` itself.

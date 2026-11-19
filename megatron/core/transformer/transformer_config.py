@@ -1441,6 +1441,23 @@ class TransformerConfig(ModelParallelConfig):
         is large enough for the all-gather to amortize.
     """
 
+    gtp_embedding_wgrad_fp32: bool = False
+    """Reduce the GTP-sharded embedding weight gradient with FP32 accumulation.
+
+    With GTP (tensor_parallel_num_weight_shards > tensor_model_parallel_size) the embedding
+    weight is sharded along the vocab dim. Its gradient comes from the lookup's autograd backward
+    in the param dtype, so by default it is scaled and ring-reduce-scattered over the GTP group
+    in BF16/FP16, rounding at every hop, before it is added to the FP32 main_grad. When set, the
+    gradient is instead exchanged at its own dtype with an all-to-all (the same bytes on the wire)
+    and summed in FP32 straight into main_grad, with the same 1/GTP mean scaling. It runs
+    synchronously, also where the reduce-scatter would otherwise overlap (the MTP stage), in
+    hidden-dim chunks whose scratch is capped at 512 MiB and freed after the call; no buffer stays
+    allocated. No effect without GTP or when the gradient is already FP32 (FP32 params);
+    VocabParallelEmbedding warns in both cases.
+    --gtp-remat-reduce-scatter-with-fp32-accumulation is no substitute with FP32 main grads,
+    because the training arguments turn it off then.
+    """
+
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
     backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default.
