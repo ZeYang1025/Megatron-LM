@@ -917,3 +917,45 @@ def test_forward_context_rebuild_rejects_weights_reloaded_before_backward(monkey
     module._load_from_state_dict({}, "", {}, True, [], [], [])
     with pytest.raises(RuntimeError, match="no longer the cached one"):
         output.backward(torch.ones_like(output))
+
+
+@pytest.mark.parametrize("use_mxfp8_weights", [False, True], ids=["bf16", "mxfp8"])
+def test_split_fc1_payload_record_follows_the_weight_view_cache(monkeypatch, use_mxfp8_weights):
+    """The rebuild's per-expert payload record is made with each new split FC1 view.
+
+    A per-iteration MXFP8 scale refresh keeps the view and so the record; reloading or
+    converting the weights drops both. A partially constructed backend has the option off.
+    """
+    module = _split_module(use_mxfp8_weights=use_mxfp8_weights)
+    assert module.recompute_forward_context is False
+    assert module._routed_fc1_payload_record is None
+
+    def fake_split(params, *, rows, columns, use_mxfp8, cached_view=None):
+        return object() if cached_view is None else cached_view
+
+    monkeypatch.setattr(mok_backend, "_native_split_weight_view", fake_split)
+    # Plain parameters have no TE rowwise storage: BF16 records the parameters' own addresses,
+    # MXFP8 records None (the rebuild then rejects them, as the MXFP8 view build does).
+    expected_ptrs = tuple(
+        None if use_mxfp8_weights else parameter.data_ptr()
+        for parameter in module.routed_fc1_parameters
+    )
+
+    first = module.quantized_routed_weights()
+    record = module._routed_fc1_payload_record
+    assert record[0] is first[0] and record[1] == expected_ptrs
+
+    module.is_first_microbatch = True
+    refreshed = module.quantized_routed_weights()
+    assert refreshed[0] is first[0]
+    assert module._routed_fc1_payload_record is record
+
+    module._load_from_state_dict({}, "", {}, True, [], [], [])
+    assert module._routed_fc1_payload_record is None
+    reloaded = module.quantized_routed_weights()
+    assert reloaded[0] is not first[0]
+    assert module._routed_fc1_payload_record[0] is reloaded[0]
+
+    module.to(torch.bfloat16)  # _apply invalidates the views derived from the parameters.
+    assert module._routed_weight_view_cache is None
+    assert module._routed_fc1_payload_record is None
