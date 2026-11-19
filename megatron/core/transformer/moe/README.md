@@ -662,6 +662,14 @@ Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`.
 per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
 static input token counts alone do not establish that lifecycle.
 
+The current backend requires grouped experts and fused gradient accumulation. It does not support
+linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
+wgrad, native shared-expert overlap, fused shared-expert-only
+recompute, expert GTP weight rematerialization, dense GTP with fused shared experts, shortcut
+MoE, inference-optimized layers, partial MoE CUDA Graph replay, MCore expert-input
+capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
+layouts.
+
 Dense GTP (`--tensor-parallel-num-weight-shards` larger than the TP size) composes with MOK when
 shared experts run natively (`shared_expert_mode: native`, or `auto` resolving to native) and
 expert GTP stays off. MOK reads only the routed expert weights, which expert GTP 1 never shards.
@@ -673,14 +681,6 @@ are rejected, because the megakernel would read GTP shards without gathering the
 `tests/unit_tests/transformer/moe/test_mok_gtp.py` checks on one four-GPU node (EP4, dense GTP4)
 that a latent, routed-only MOK layer reproduces its no-GTP outputs, input gradients and reduced
 gradients, in BF16 and MXFP8 and with shared-expert or whole-MoE recompute.
-
-The current backend requires grouped experts and fused gradient accumulation. It does not support
-linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
-wgrad, native shared-expert overlap, fused shared-expert-only
-recompute, expert GTP weight rematerialization, dense GTP with fused shared experts, shortcut
-MoE, inference-optimized layers, partial MoE CUDA Graph replay, MCore expert-input
-capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
-layouts.
 
 
 ### GLU Checkpoint Layout
