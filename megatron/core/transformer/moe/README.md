@@ -538,9 +538,28 @@ which is an optional dependency and is imported only when the backend is selecte
 | Activation | SwiGLU |
 | Routed weight layout | Single-grouped and per-expert non-single weights |
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64} |
-| Recomputation | Whole-MoE activation recompute |
+| Recomputation | Whole-MoE activation recompute; MOK forward-context recompute (`--moe-mok-recompute-forward-context`, MOK d59188a or newer, not with a MOK-fused gated shared expert) |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+Without MoE-layer recompute, MOK keeps a forward context from each MoE forward to its backward:
+FP8 copies of the first macrobatch's dispatched input, gate, up and activation output, sized by
+`macrobatch_size` at `(H + 3 * I) * 33 / 32` bytes per row in MXFP8 (1.61 GiB per layer and
+microbatch for Kimi-K3's latent `H = 3584`, `I = 3072` at the default 131072 rows).
+`--moe-mok-recompute-forward-context` releases that context after forward and rebuilds it right
+before the layer's backward with MOK's `functional.recompute_forward_context` (MOK d59188a or
+newer). The rebuild reruns only dispatch, routed FC1 and the activation for that macrobatch, not
+the router, latent projections, FC2 or combine. Because the rebuild op accepts only contiguous
+gate/up weights, MCore packs each expert's combined FC1 rows (and MXFP8 scale blocks) into a
+transient `[E, I, H]` copy for its duration, after checking that every expert's payload is still
+where MOK's weight descriptors (and so the forward) read it. The rebuild is an EP collective that
+runs inside the MOK autograd node's backward, so it keeps MOK's existing EP ordering, and
+gradients are bitwise identical to the default. MOK calls that an activation checkpoint replays
+(`moe` in `recompute_modules`, full recompute) keep their context instead. The option supports
+BF16 and MXFP8, both routed weight layouts, and MOK-fused ungated shared experts; MOK cannot
+rebuild a gated fused shared expert's context, so that combination is rejected. The backend's
+`recompute_forward_context` attribute switches the option per layer (every EP rank must switch it
+alike), with the same checks as the flag.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap/gating, shared-expert-only
