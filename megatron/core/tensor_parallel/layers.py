@@ -4,6 +4,7 @@
 # repo: https://github.com/pytorch/pytorch
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from functools import partial
@@ -14,7 +15,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
-from megatron.core._rank_utils import warn_single_rank
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -61,6 +62,8 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+logger = logging.getLogger(__name__)
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
@@ -463,19 +466,24 @@ class VocabParallelEmbedding(torch.nn.Module):
         if gtp_embedding_wgrad_fp32:
             # Checked here, not in TransformerConfig: only this module knows whether the
             # embedding is GTP-sharded (the GTP group comes from pg_collection / the MPU), and
-            # these are the cases GTPShardedParam._uses_fp32_wgrad_reduction then skips.
+            # these are the cases GTPShardedParam._uses_fp32_wgrad_reduction then skips. Logged,
+            # not warnings.warn, so that a launch with PYTHONWARNINGS=ignore still shows them.
             if self.gtp_remat_size <= 1:
-                warn_single_rank(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     "gtp_embedding_wgrad_fp32 has no effect: the embedding is not GTP-sharded "
                     "(dense GTP is off: tensor_parallel_num_weight_shards equals "
                     "tensor_model_parallel_size), so its gradient is never reduce-scattered over "
-                    "a GTP group."
+                    "a GTP group.",
                 )
             elif self.weight.dtype not in (torch.bfloat16, torch.float16):
-                warn_single_rank(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     f"gtp_embedding_wgrad_fp32 has no effect with {self.weight.dtype} embedding "
                     "weights: the GTP reduce-scatter of their gradient already accumulates in "
-                    "that precision."
+                    "that precision.",
                 )
 
     def _fuse_wgrad_accumulation(self, weight: torch.Tensor) -> bool:

@@ -15,6 +15,7 @@ Four ranks on one node:
 """
 
 import functools
+import logging
 import warnings
 
 import pytest
@@ -48,6 +49,8 @@ HIDDEN = 8
 # One coefficient per rank. Every local gradient is representable in BF16/FP16, but the mean
 # across ranks is not, so any rounding to the wgrad dtype after reduction loses real bits.
 RANK_COEFFICIENTS = [1.0, 2**-7, 2**-8, 2**-9]
+# VocabParallelEmbedding logs its gtp_embedding_wgrad_fp32 notices through this module's logger.
+_LAYERS_LOGGER = "megatron.core.tensor_parallel.layers"
 _GTP_CONFIG_KEYS = (
     "pad_for_alignment",
     "async_reduction",
@@ -264,8 +267,21 @@ def test_fp32_embedding_wgrad_chunked_and_padded(
         torch.testing.assert_close(p.main_grad, wanted, rtol=0, atol=0)
 
 
+def _flag_notices(caplog, caught):
+    """The gtp_embedding_wgrad_fp32 notices VocabParallelEmbedding logged, and any it warned."""
+    logged = [
+        record
+        for record in caplog.records
+        if record.name == _LAYERS_LOGGER and "gtp_embedding_wgrad_fp32" in record.getMessage()
+    ]
+    warned = [str(w.message) for w in caught if "gtp_embedding_wgrad_fp32" in str(w.message)]
+    return logged, warned
+
+
 @pytest.mark.parametrize("fp32_embedding_wgrad", [False, True])
-def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32_embedding_wgrad):
+def test_vocab_parallel_embedding_wires_the_config_flag(
+    restore_gtp_config, fp32_embedding_wgrad, caplog
+):
     """TransformerConfig.gtp_embedding_wgrad_fp32 reaches the GTP embedding weight of a
     VocabParallelEmbedding and, when set, makes its main_grad the exact FP32 mean."""
     _require_four_ranks()
@@ -290,12 +306,15 @@ def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32
             tensor_parallel_num_weight_shards=WORLD_SIZE,
             gtp_embedding_wgrad_fp32=fp32_embedding_wgrad,
         )
-        with warnings.catch_warnings(record=True) as caught:
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            caplog.at_level(logging.WARNING, logger=_LAYERS_LOGGER),
+        ):
             warnings.simplefilter("always")
             embedding = VocabParallelEmbedding(
                 num_rows, HIDDEN, init_method=torch.nn.init.zeros_, config=config
             )
-        assert not [w for w in caught if "gtp_embedding_wgrad_fp32" in str(w.message)]
+        assert _flag_notices(caplog, caught) == ([], [])
         weight = embedding.weight
         assert gtp_module.is_gtp_param(weight)
         assert weight._wgrad_reduce_in_fp32 is fp32_embedding_wgrad
@@ -323,10 +342,11 @@ def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32
 
 
 @pytest.mark.parametrize("case", ["gtp_off", "fp32_params"])
-def test_flag_warns_where_it_has_no_effect(restore_gtp_config, case):
+def test_flag_warns_where_it_has_no_effect(restore_gtp_config, case, caplog):
     """gtp_embedding_wgrad_fp32 does nothing without a GTP group to reduce over, or for FP32
     weights (their gradient already reduces in FP32). VocabParallelEmbedding, which decides
-    whether the embedding is GTP-sharded, says so once per job (on the default log rank)."""
+    whether the embedding is GTP-sharded, says so once per job (on the default log rank) as a
+    logged WARNING: a launch with PYTHONWARNINGS=ignore would drop a warnings.warn."""
     _require_four_ranks()
     from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -343,17 +363,21 @@ def test_flag_warns_where_it_has_no_effect(restore_gtp_config, case):
             tensor_parallel_num_weight_shards=WORLD_SIZE if gtp else None,
             gtp_embedding_wgrad_fp32=True,
         )
-        with warnings.catch_warnings(record=True) as caught:
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            caplog.at_level(logging.WARNING, logger=_LAYERS_LOGGER),
+        ):
             warnings.simplefilter("always")
             embedding = VocabParallelEmbedding(
                 16, HIDDEN, init_method=torch.nn.init.zeros_, config=config
             )
         assert bool(gtp_module.is_gtp_param(embedding.weight)) is gtp
-        no_effect = [
-            w for w in caught if "gtp_embedding_wgrad_fp32 has no effect" in str(w.message)
-        ]
+        logged, warned = _flag_notices(caplog, caught)
+        assert warned == []
         expected = 1 if dist.get_rank() in get_default_log_ranks() else 0
-        assert len(no_effect) == expected, [str(w.message) for w in caught]
+        assert len(logged) == expected, [record.getMessage() for record in logged]
+        assert all(record.levelno == logging.WARNING for record in logged)
+        assert all("gtp_embedding_wgrad_fp32 has no effect" in r.getMessage() for r in logged)
     finally:
         torch.cuda.synchronize()
         dist.barrier()
