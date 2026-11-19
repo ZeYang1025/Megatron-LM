@@ -1438,7 +1438,9 @@ class TransformerConfig(ModelParallelConfig):
 
       - ``"moe_latent_proj"`` — shard ``fc1_latent_proj`` / ``fc2_latent_proj`` (MoE latent
         projections, ``parallel_mode="duplicated"``). Only beneficial when ``moe_latent_size``
-        is large enough for the all-gather to amortize.
+        is large enough for the all-gather to amortize. With
+        ``moe_latent_up_projection_rmsnorm``, only the linear weight of the fused RMSNorm
+        up-projection is sharded; its RMSNorm scale stays replicated.
     """
 
     moe_flex_dispatcher_num_sms: Optional[int] = None

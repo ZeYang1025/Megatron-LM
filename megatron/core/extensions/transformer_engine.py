@@ -1578,7 +1578,12 @@ class TELinear(te.pytorch.Linear):
 
 
 class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
-    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks.
+
+    With a ``gtp_remat_group`` of size > 1, only the linear weight is GTP_remat-sharded along its
+    output dimension (alignment padding included) and rematerialized before the GEMM; the RMSNorm
+    scale and any bias stay replicated at their logical widths.
+    """
 
     def __init__(
         self,
@@ -1594,7 +1599,18 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        """
+        Args:
+            tp_group (ProcessGroup | None): owning TP group, recorded only for checkpoint
+                metadata; TE executes with ``tp_size=1``.
+            gtp_remat_group (ProcessGroup | None): GTP_remat group that shards the linear
+                weight; ``None`` or size 1 keeps the weight replicated.
+            gtp_replica_group (ProcessGroup | None): the GTP_remat-excluded DP x CP group,
+                stamped on the sharded weight to elect its checkpoint writer.
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1629,15 +1645,21 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
-        # groups here and wrap TE construction in `_init_gtp_remat_context` with
-        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
-        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
-        # and the rematerialized output keeps the logical [..., output_size] shape.
-        with init_quant_context:
+        # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            replica_group=gtp_replica_group,
+        )
+        # Only the linear weight is sharded; the RMSNorm scale keeps its full input width
+        # (TE sizes it from in_features), and the rematerialized output keeps output_size.
+        with init_quant_context, init_gtp_remat_context as gtp_output_size:
             super().__init__(
                 in_features=input_size,
-                out_features=output_size,
+                out_features=gtp_output_size,
                 eps=self.config.layernorm_epsilon,
                 sequence_parallel=False,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
@@ -1656,8 +1678,7 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
                 **extra_kwargs,
             )
 
-        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
-        # shards only the linear weight, so bias must remain replicated at [output_size].
+        # Under GTP the context also restored any bias to its logical, replicated [output_size].
         self._tp_group = (
             tp_group
             if tp_group is not None
