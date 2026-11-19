@@ -256,6 +256,7 @@ def _make_routes(generator, num_experts: int, device) -> tuple[torch.Tensor, tor
 # --------------------------------------------------------------------------------------------
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("macrobatch_size", [MULTI_MACROBATCH, SINGLE_MACROBATCH])
 @pytest.mark.parametrize("activation", ["situ", "silu"])
 @pytest.mark.parametrize("precision", ["mxfp8", "bf16"])
@@ -597,6 +598,7 @@ _LAYER_CASES = [
 ]
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     ("precision", "activation", "macrobatch_size", "shared", "single_grouped"), _LAYER_CASES
 )
@@ -769,6 +771,7 @@ def _run_pipeline(functional, layers, microbatches, *, rebuild) -> _PipelineRun:
     )
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     ("precision", "activation"),
     [pytest.param("mxfp8", "situ", id="mxfp8-situ"), pytest.param("bf16", "silu", id="bf16-silu")],
@@ -814,6 +817,7 @@ def test_option_is_bitwise_identical_across_interleaved_layers_and_microbatches(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.launch_on_gb200
 def test_checkpoint_replay_keeps_the_context():
     """'moe' recompute replays the MoK call inside the checkpoint's backward; with the option on,
     that call keeps its context (no rebuild) and gradients stay bitwise identical."""
