@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Whether this process has logged that moe_mok_recompute_forward_context released a forward
-# context; the confirmation is logged once per run, not per layer and microbatch.
+# context; the confirmation is logged once per process, not per layer and microbatch.
 _forward_context_release_logged = False
 
 

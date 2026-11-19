@@ -571,7 +571,7 @@ rebuild a gated fused shared expert's context, so that combination is rejected. 
 `recompute_forward_context` attribute switches the option per layer (every EP rank must switch it
 alike), with the same checks as the flag. The first MoE forward that releases a context to be
 rebuilt logs `MOK forward-context recompute (moe_mok_recompute_forward_context) is active` with
-the routed context's size, once per run on rank 0.
+the routed context's size, once per process on the default log rank (rank 0).
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap, MOK-fused
