@@ -5,8 +5,10 @@ With the option on, ``_MoKAutograd`` releases MoK's saved forward context after 
 rebuilds it before backward with ``mok.functional.recompute_forward_context``, from routed FC1
 packed out of MCore's combined per-expert weights. These tests check that the rebuilt context
 equals the dropped one bit for bit, that gradients are bitwise identical with the option off and
-on, that forward keeps exactly the context's bytes less, and that a call replayed by an
-activation checkpoint keeps its context instead of rebuilding it.
+on (also with two layers and three microbatches interleaved in 1F1B order on MoK's shared
+workspace), that forward keeps exactly the context's bytes less, and that a call replayed by an
+activation checkpoint keeps its context instead of rebuilding it. The CPU tests of the adapter
+wiring, with MoK mocked, are in test_mok_megakernel.py.
 
 The config tests need only torch. The GPU tests need a Blackwell GPU (SM100/SM103), a
 mixture-of-kittens build with ``functional.recompute_forward_context`` (d59188a or newer) and
@@ -386,7 +388,8 @@ class _Run(NamedTuple):
     backward_views: Optional[dict]
 
 
-def _build_mok_layer(precision, activation, macrobatch_size, shared, single_grouped):
+def _build_mok_layers(precision, activation, macrobatch_size, shared, single_grouped, count=1):
+    """Build ``count`` MoE layers on one EP group, so that their MOK calls share one workspace."""
     from megatron.core.fp8_utils import get_fp8_context
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
@@ -401,7 +404,7 @@ def _build_mok_layer(precision, activation, macrobatch_size, shared, single_grou
     model_parallel_cuda_manual_seed(123)
     num_experts = NUM_LOCAL_EXPERTS * ep
     values = dict(
-        num_layers=1,
+        num_layers=count,
         hidden_size=HIDDEN,
         num_attention_heads=4,
         num_moe_experts=num_experts,
@@ -422,8 +425,8 @@ def _build_mok_layer(precision, activation, macrobatch_size, shared, single_grou
         attention_dropout=0.0,
         expert_model_parallel_size=ep,
         moe_megakernel_backend="mok",
-        # Built with the option on, so the backend's construction-time MoK capability check
-        # runs; the tests then switch it per call through backend.recompute_forward_context.
+        # Built with the option on, so the backend checks MoK's rebuild support; the tests then
+        # switch it per run through the backend's recompute_forward_context property.
         moe_mok_recompute_forward_context=True,
         moe_megakernel_backend_config=dict(
             fwd_num_comm_sms=2,
@@ -446,25 +449,34 @@ def _build_mok_layer(precision, activation, macrobatch_size, shared, single_grou
             num_experts=num_experts, moe_grouped_gemm=True
         ).mlp
     )
-    init_context = (
-        get_fp8_context(config, is_init=True) if precision == "mxfp8" else contextlib.nullcontext()
-    )
-    with init_context:
-        layer = MoELayer(
-            config,
-            submodules,
-            layer_number=1,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    layers = []
+    for layer_number in range(1, count + 1):
+        init_context = (
+            get_fp8_context(config, is_init=True)
+            if precision == "mxfp8"
+            else contextlib.nullcontext()
         )
-    layer = layer.cuda()
-    backend = layer.megakernel_experts
-    assert backend.recompute_forward_context
-    parameters = dict(backend.named_parameters())
-    for parameter in parameters.values():
-        # DDP would own these; MoK accumulates weight gradients into them.
-        parameter.main_grad = torch.zeros(parameter.shape, dtype=torch.float32, device="cuda")
-    # Callers keep the layer: it owns the native expert modules the backend aliases.
-    return layer, backend, parameters
+        with init_context:
+            layer = MoELayer(
+                config,
+                submodules,
+                layer_number=layer_number,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+        layer = layer.cuda()
+        backend = layer.megakernel_experts
+        assert backend.recompute_forward_context
+        parameters = dict(backend.named_parameters())
+        for parameter in parameters.values():
+            # DDP would own these; MoK accumulates weight gradients into them.
+            parameter.main_grad = torch.zeros(parameter.shape, dtype=torch.float32, device="cuda")
+        # Callers keep the layer: it owns the native expert modules the backend aliases.
+        layers.append((layer, backend, parameters))
+    return layers
+
+
+def _build_mok_layer(precision, activation, macrobatch_size, shared, single_grouped):
+    return _build_mok_layers(precision, activation, macrobatch_size, shared, single_grouped)[0]
 
 
 def _layer_inputs(num_experts):
@@ -553,7 +565,8 @@ def _run(functional, backend, parameters, inputs, *, rebuild, checkpointed=False
     )
 
 
-def _assert_same_results(actual: _Run, expected: _Run, what: str) -> None:
+def _assert_same_results(actual, expected, what: str) -> None:
+    """Bitwise comparison of two runs' ``results`` (a _Run or a _PipelineRun)."""
     assert actual.results.keys() == expected.results.keys()
     for name, tensor in expected.results.items():
         _assert_bitwise_equal(actual.results[name], tensor, f"{what}: {name}")
@@ -631,6 +644,171 @@ def test_option_is_bitwise_identical_and_drops_the_context(
         else:
             # memory_allocated rounds blocks; allow 2 MiB of allocator slack per context tensor.
             assert expected <= saved <= expected + 8 * (2 << 20), (saved, expected)
+    finally:
+        functional.clear_workspace_cache()
+        Utils.destroy_model_parallel()
+
+
+# --------------------------------------------------------------------------------------------
+# Training lifecycle: several layers and microbatches in flight on one shared MoK workspace
+# --------------------------------------------------------------------------------------------
+
+# One pipeline stage's 1F1B order with two microbatches in flight: F<m> runs microbatch m through
+# every layer, B<m> backpropagates it through every layer in reverse.
+_PIPELINE_SCHEDULE = ("F0", "F1", "B0", "F2", "B1", "B2")
+_PIPELINE_MICROBATCHES = 3
+_PIPELINE_IN_FLIGHT = 2
+
+
+class _PipelineRun(NamedTuple):
+    results: dict
+    kept_bytes: int
+    exact_bytes: bool
+    rebuilds: int
+
+
+def _pipeline_inputs(num_experts: int, num_layers: int):
+    """Per microbatch: the first layer's input, per-layer routes and the output gradient."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device=device).manual_seed(777 + torch.distributed.get_rank())
+    microbatches = []
+    for _ in range(_PIPELINE_MICROBATCHES):
+        x = torch.randn(
+            NUM_TOKENS, HIDDEN, generator=generator, device=device, dtype=torch.bfloat16
+        )
+        routes = []
+        for _ in range(num_layers):
+            top_experts, _ = _make_routes(generator, num_experts, device)
+            routing_map = torch.zeros(NUM_TOKENS, num_experts, dtype=torch.bool, device=device)
+            routing_map.scatter_(1, top_experts, True)
+            probs = torch.rand(NUM_TOKENS, num_experts, generator=generator, device=device)
+            routes.append((probs, routing_map))
+        upstream = (
+            torch.randn(
+                NUM_TOKENS, HIDDEN, generator=generator, device=device, dtype=torch.bfloat16
+            )
+            / 16
+        )
+        microbatches.append((x, routes, upstream))
+    return microbatches
+
+
+def _run_pipeline(functional, layers, microbatches, *, rebuild) -> _PipelineRun:
+    """Run the microbatches through the chained layers in _PIPELINE_SCHEDULE order.
+
+    Every MoK call after the first finds the shared workspace last used by another layer or
+    microbatch, and each layer's rebuild runs after other layers' and microbatches' forwards,
+    rebuilds and backwards, in the order 1F1B uses them in training.
+    """
+    parameters = {}
+    for index, (_, backend, layer_parameters) in enumerate(layers):
+        backend.recompute_forward_context = rebuild
+        for name, parameter in layer_parameters.items():
+            parameter.main_grad.zero_()
+            parameter.grad = None
+            parameter.grad_added_to_main_grad = False
+            parameters[f"layer{index}.{name}"] = parameter
+    # As MCore DDP's backward post-hook does: MoK accumulated the gradient into main_grad, and
+    # .grad holds a sentinel aliasing the parameter that must not accumulate across microbatches.
+    # The accumulator nodes are kept alive for the hooks to stay registered.
+    accumulators, handles = [], []
+    for parameter in parameters.values():
+        accumulator = parameter.expand_as(parameter).grad_fn.next_functions[0][0]
+        handles.append(
+            accumulator.register_hook(
+                lambda *_, parameter=parameter: setattr(parameter, "grad", None)
+            )
+        )
+        accumulators.append(accumulator)
+
+    calls = {"rebuild": 0}
+    real_rebuild = functional.recompute_forward_context
+
+    def rebuild_spy(*args, **kwargs):
+        calls["rebuild"] += 1
+        return real_rebuild(*args, **kwargs)
+
+    in_flight, results = {}, {}
+
+    def forward(microbatch):
+        x, routes, upstream = microbatches[microbatch]
+        x = x.detach().clone().requires_grad_()
+        probs = [router_probs.detach().clone().requires_grad_() for router_probs, _ in routes]
+        hidden = x
+        for (_, backend, _), router_probs, (_, routing_map) in zip(layers, probs, routes):
+            hidden = backend(hidden, router_probs, routing_map)
+        in_flight[microbatch] = (hidden, x, probs, upstream)
+
+    def backward(microbatch):
+        output, x, probs, upstream = in_flight.pop(microbatch)
+        output.backward(upstream)
+        results[f"mb{microbatch}.output"] = output.detach()
+        results[f"mb{microbatch}.x.grad"] = x.grad
+        for index, router_probs in enumerate(probs):
+            results[f"mb{microbatch}.layer{index}.probs.grad"] = router_probs.grad
+
+    kept_bytes = None
+    try:
+        with patch.object(functional, "recompute_forward_context", rebuild_spy):
+            before, exact = _live_bytes()
+            for step in _PIPELINE_SCHEDULE:
+                (forward if step[0] == "F" else backward)(int(step[1:]))
+                if len(in_flight) == _PIPELINE_IN_FLIGHT and kept_bytes is None:
+                    kept_bytes = _live_bytes()[0] - before
+        torch.cuda.synchronize()
+    finally:
+        for handle in handles:
+            handle.remove()
+    del accumulators
+    assert not in_flight
+    for name, parameter in parameters.items():
+        assert parameter.grad_added_to_main_grad, name
+        results[f"{name}.main_grad"] = parameter.main_grad.clone()
+    return _PipelineRun(
+        results=results, kept_bytes=kept_bytes, exact_bytes=exact, rebuilds=calls["rebuild"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("precision", "activation"),
+    [pytest.param("mxfp8", "situ", id="mxfp8-situ"), pytest.param("bf16", "silu", id="bf16-silu")],
+)
+def test_option_is_bitwise_identical_across_interleaved_layers_and_microbatches(
+    precision, activation
+):
+    """Two chained MoE layers share MoK's workspace; three microbatches run in 1F1B order with
+    two in flight. Option on and off must give bitwise-identical outputs and gradients, and the
+    option must keep exactly the in-flight contexts' bytes less."""
+    functional = _require_mok_layer(False)
+    try:
+        layers = _build_mok_layers(precision, activation, MULTI_MACROBATCH, None, False, count=2)
+        microbatches = _pipeline_inputs(layers[0][0].config.num_moe_experts, len(layers))
+
+        # The first run builds MoK's workspace and MCore's cached weight views; the second checks
+        # that the baseline itself is bitwise reproducible under this interleaving.
+        warmup = _run_pipeline(functional, layers, microbatches, rebuild=False)
+        off = _run_pipeline(functional, layers, microbatches, rebuild=False)
+        _assert_same_results(off, warmup, "pipeline, option off, rerun (MoK determinism)")
+        on = _run_pipeline(functional, layers, microbatches, rebuild=True)
+        _assert_same_results(on, off, "pipeline, option on vs off")
+
+        assert off.rebuilds == 0
+        assert on.rebuilds == len(layers) * _PIPELINE_MICROBATCHES
+        # With two microbatches in flight, the option keeps every layer's two contexts less.
+        expected = (
+            _PIPELINE_IN_FLIGHT
+            * len(layers)
+            * fc1_layout.routed_forward_context_nbytes(
+                MULTI_MACROBATCH, HIDDEN, FFN, mxfp8=precision == "mxfp8"
+            )
+        )
+        contexts = _PIPELINE_IN_FLIGHT * len(layers)
+        saved = off.kept_bytes - on.kept_bytes
+        if off.exact_bytes:
+            assert abs(saved - expected) <= contexts * 4096, (saved, expected)
+        else:
+            # memory_allocated rounds blocks; allow 2 MiB of slack per context tensor.
+            assert expected <= saved <= expected + contexts * 8 * (2 << 20), (saved, expected)
     finally:
         functional.clear_workspace_cache()
         Utils.destroy_model_parallel()
