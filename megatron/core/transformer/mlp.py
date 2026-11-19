@@ -417,8 +417,9 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(
+                        sub_sd[k] = apply_gtp_swiglu_sharded_factory(
                             v,
+                            getattr(module, k.rsplit(".", 1)[-1], None),
                             sharded_offsets,
                             singleton_local_shards,
                             tp_group=self.tp_group,
@@ -469,6 +470,59 @@ class MLP(MegatronModule):
             ffn_hidden_size=ffn_hidden_size,
             name=name,
         )
+
+
+def apply_gtp_swiglu_sharded_factory(
+    original_sh_ten: ShardedTensor,
+    param: torch.Tensor | None,
+    sharded_offsets: tuple,
+    singleton_local_shards: bool = False,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    dp_group: torch.distributed.ProcessGroup | None = None,
+) -> ShardedTensorFactory:
+    """Checkpoint a gated linear unit FC1 weight or bias in logical gate/up order.
+
+    A GTP rank holds a contiguous row slice of the TP-local ``[gate; up]`` pair, which is not
+    one gate half plus one up half, so splitting the shard in two would mislabel rows. For a
+    GTP-sharded ``param`` this saves the shard's intersections with the gate and up halves as
+    views under the ordinary gate-major/up-major coordinates, without gathering, and binds a
+    source-bound optimizer companion (see ``dist_checkpointing/gtp.py``). Any other tensor
+    goes through :func:`apply_swiglu_sharded_factory` unchanged.
+
+    Args:
+        original_sh_ten: the ShardedTensor that ``linear_fc1`` emits for ``param``.
+        param: the live ``linear_fc1`` parameter, or None if the module exposes none.
+        sharded_offsets, singleton_local_shards, tp_group, dp_group: as in
+            :func:`apply_swiglu_sharded_factory`.
+
+    Raises:
+        ValueError: a GTP ``param`` has an odd number of TP-local logical rows.
+    """
+    from megatron.core.dist_checkpointing.gtp import gtp_logical_rows, split_gtp_projection
+
+    logical_rows = gtp_logical_rows(param)
+    if logical_rows is not None:
+        if logical_rows % 2:
+            raise ValueError(
+                f'GLU projection {original_sh_ten.key} has an odd number of TP-local rows '
+                f'({logical_rows}); it cannot be split into equal gate and up halves'
+            )
+        return split_gtp_projection(
+            original_sh_ten,
+            param,
+            [logical_rows // 2, logical_rows // 2],
+            ['w', 'v'],
+            tp_group,
+            glu=True,
+            singleton_local_shards=singleton_local_shards,
+        )
+    return apply_swiglu_sharded_factory(
+        original_sh_ten,
+        sharded_offsets,
+        singleton_local_shards,
+        tp_group=tp_group,
+        dp_group=dp_group,
+    )
 
 
 # pylint: disable=missing-function-docstring

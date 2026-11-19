@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing.gtp import split_gtp_projection
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -737,19 +738,29 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             sharded_state_dict.update(module_sharded_sd)
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
+        # tensors must be additionally split into separate parts.
+        # A GTP in_proj holds a row slice of the TP-local projection whose boundaries need not
+        # match the split sections, so it saves its intersections with them instead, under the
+        # same keys and coordinates (see dist_checkpointing/gtp.py).
+        in_proj_entry = sharded_state_dict[f"{prefix}in_proj.weight"]
+        in_proj_factory = split_gtp_projection(
+            in_proj_entry,
+            self.in_proj.weight,
             list(self.in_proj_split_sections),
             self.in_proj_split_names,
-            0,
+            tp_group,
         )
+        if in_proj_factory is None:
+            in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+            assert in_proj_entry.data.size(0) == in_proj_dim_local_tp, (
+                in_proj_dim_local_tp,
+                in_proj_entry,
+            )
+
+            in_proj_factory = _split_tensor_factory(
+                in_proj_entry, list(self.in_proj_split_sections), self.in_proj_split_names, 0
+            )
+        sharded_state_dict[f"{prefix}in_proj.weight"] = in_proj_factory
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
