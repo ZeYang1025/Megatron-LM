@@ -548,6 +548,7 @@ def _gtp_pre_init(
     is_expert=False,
     rng_via_kwarg=True,
     out_split_size=1,
+    duplicated=False,
 ):
     """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
     RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
@@ -556,6 +557,9 @@ def _gtp_pre_init(
     column-parallel, else 1). GTP pads the per-TP slice (``output_size // out_split_size``) so each
     rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
     post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
+
+    ``duplicated=True`` marks a weight duplicated across TP ranks (``parallel_mode="duplicated"``):
+    TP peers hold the same GTP_remat shard, so its init stream must not depend on the TP rank.
     """
     from megatron.core.tensor_parallel.gtp_api import gtp_remat_shard_dim0
     from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
@@ -567,7 +571,7 @@ def _gtp_pre_init(
     shard_out = per_rank * out_split_size
     gtp_ctx = (gtp_remat_group, pad_length, output_size)
 
-    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
+    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert, duplicated=duplicated)
     if rng_via_kwarg:
         extra_kwargs["rng_tracker_name"] = tracker_name
     else:
@@ -614,12 +618,14 @@ def _init_gtp_remat_context(
     rng_via_kwarg=True,
     out_split_size=1,
     replica_group=None,
+    duplicated=False,
 ):
     """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
     GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
 
     ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
     ``replica_group`` = the caller's gtp_remat-excluded DP x CP group (checkpoint writer election).
+    ``duplicated`` = the weight is duplicated across TP ranks (TP-invariant init stream).
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         yield output_size
@@ -632,6 +638,7 @@ def _init_gtp_remat_context(
         is_expert=is_expert,
         rng_via_kwarg=rng_via_kwarg,
         out_split_size=out_split_size,
+        duplicated=duplicated,
     )
     yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
@@ -1482,6 +1489,8 @@ class TELinear(te.pytorch.Linear):
             is_expert=is_expert,
             out_split_size=tp_size if te_parallel_mode == "column" else 1,
             replica_group=gtp_replica_group,
+            # TP peers of a duplicated weight hold the same GTP_remat shard.
+            duplicated=parallel_mode == "duplicated",
         )
 
         with init_quant_context, init_gtp_remat_context as output_size:
@@ -1646,6 +1655,8 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
         )
 
         # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
+        # duplicated=True: TP peers hold the same GTP_remat shard, so they must draw the same
+        # init values (the default GTP stream varies with the TP rank).
         init_gtp_remat_context = _init_gtp_remat_context(
             self,
             output_size,
@@ -1653,6 +1664,7 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             replica_group=gtp_replica_group,
+            duplicated=True,
         )
         # Only the linear weight is sharded; the RMSNorm scale keeps its full input width
         # (TE sizes it from in_features), and the rematerialized output keeps output_size.

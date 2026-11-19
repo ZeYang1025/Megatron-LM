@@ -416,6 +416,7 @@ def _worker_seed_custom_gtp_groups_without_mpu(rank, world_size, port):
         states = get_cuda_rng_tracker().get_states()
         assert get_gtp_remat_rng_tracker_name() in states
         assert get_gtp_remat_rng_tracker_name(is_expert=True) in states
+        assert get_gtp_remat_rng_tracker_name(duplicated=True) in states
     finally:
         ps.initialize_model_parallel()
 

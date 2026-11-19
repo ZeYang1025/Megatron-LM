@@ -133,6 +133,9 @@ _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 # registered only when the axis is active (see model_parallel_cuda_manual_seed).
 _GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
 _EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
+# Same per-GTP_remat-rank draws, but identical across TP ranks: for weights duplicated across TP
+# (parallel_mode="duplicated"), which GTP_remat shards while TP peers hold the same shard.
+_GTP_REMAT_DUPLICATED_RNG_TRACKER_NAME = 'gtp-remat-duplicated-rng'
 
 
 def _get_cuda_rng_state(
@@ -255,8 +258,23 @@ def get_data_parallel_rng_tracker_name():
     return _DATA_PARALLEL_RNG_TRACKER_NAME
 
 
-def get_gtp_remat_rng_tracker_name(is_expert=False):
-    """Get the (E)GTP_remat weight-init rng tracker name (per-(E)GTP-rank distinct draws)."""
+def get_gtp_remat_rng_tracker_name(is_expert=False, duplicated=False):
+    """Get the (E)GTP_remat weight-init rng tracker name (per-(E)GTP-rank distinct draws).
+
+    Args:
+        is_expert: select the expert (EGTP_remat) stream.
+        duplicated: select the stream for a dense weight duplicated across TP ranks
+            (``parallel_mode="duplicated"``). GTP_remat still shards such a weight, but TP peers
+            hold the same shard, so they must draw the same values: this stream does not depend
+            on the TP rank, while the default dense stream does.
+    """
+    if duplicated:
+        if is_expert:
+            raise ValueError(
+                "GTP_remat has no weight-init stream for expert weights duplicated across TP "
+                "ranks; GTP-shard duplicated linears only as dense (non-expert) modules"
+            )
+        return _GTP_REMAT_DUPLICATED_RNG_TRACKER_NAME
     return _EXPERT_GTP_REMAT_RNG_TRACKER_NAME if is_expert else _GTP_REMAT_RNG_TRACKER_NAME
 
 
@@ -625,6 +643,13 @@ def model_parallel_cuda_manual_seed(
     if gtp_remat_world_size > 1:
         gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
+        # Weights duplicated across TP are GTP_remat-sharded the same way on every TP rank, so
+        # their stream must not include tp_rank: base it on the TP-invariant data-parallel seed.
+        # The stride keeps it disjoint from the seeds above for any realistic tp/ep/etp rank.
+        gtp_remat_duplicated_seed = data_parallel_seed + 65536 * (1 + gtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(
+            _GTP_REMAT_DUPLICATED_RNG_TRACKER_NAME, gtp_remat_duplicated_seed
+        )
     if egtp_remat_world_size > 1:
         egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
