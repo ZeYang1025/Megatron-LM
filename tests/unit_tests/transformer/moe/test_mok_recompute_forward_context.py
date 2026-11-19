@@ -6,9 +6,12 @@ rebuilds it before backward with ``mok.functional.recompute_forward_context``, f
 packed out of MCore's combined per-expert weights. These tests check that the rebuilt context
 equals the dropped one bit for bit, that gradients are bitwise identical with the option off and
 on (also with two layers and three microbatches interleaved in 1F1B order on MoK's shared
-workspace), that forward keeps exactly the context's bytes less, and that a call replayed by an
-activation checkpoint keeps its context instead of rebuilding it. The CPU tests of the adapter
-wiring, with MoK mocked, are in test_mok_megakernel.py.
+workspace, with several macrobatches and with one, as Kimi-K3 runs), that forward keeps exactly
+the context's bytes less, and that a call replayed by an activation checkpoint keeps its context
+instead of rebuilding it. MoK's rebuild runs with new allocations filled with NaN / 0xFF, so a
+row it leaves unwritten cannot match by reusing the forward's freed blocks, and a control checks
+that a rebuild from a wrong FC1 pack fails these checks. The CPU tests of the adapter wiring,
+with MoK mocked, are in test_mok_megakernel.py.
 
 The config tests need only torch. The GPU tests need a Blackwell GPU (SM100/SM103), a
 mixture-of-kittens build with ``functional.recompute_forward_context`` (d59188a or newer) and
@@ -23,8 +26,10 @@ the Kimi-K3 container, from the Megatron-LM checkout::
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import re
+import warnings
 from typing import NamedTuple, Optional
 from unittest.mock import patch
 
@@ -190,6 +195,55 @@ def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, name: st
     assert mismatches == 0, f"{name}: {mismatches} of {actual.numel()} elements differ bitwise"
 
 
+@contextlib.contextmanager
+def _deterministic_fill():
+    """Meanwhile torch fills every new tensor: NaN if floating, its maximum value if integer."""
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill = torch.utils.deterministic.fill_uninitialized_memory
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.utils.deterministic.fill_uninitialized_memory = True
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill
+
+
+@functools.cache
+def _fill_covers_mok_context_dtypes() -> bool:
+    """Whether _deterministic_fill fills new CUDA tensors of the dtypes in MoK's context."""
+    try:
+        with _deterministic_fill():
+            fp8, bf16, scale = (
+                torch.empty(64, dtype=dtype, device="cuda")
+                for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.uint8)
+            )
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+    return bool(fp8.float().isnan().all() and bf16.isnan().all() and (scale == 255).all())
+
+
+@contextlib.contextmanager
+def _poisoned_new_allocations():
+    """New CUDA tensors created meanwhile start as NaN or 0xFF bytes, never as stale data.
+
+    Wraps MoK's context rebuild only. Without it, a valid row the rebuild leaves unwritten could
+    still compare equal: the caching allocator can hand the rebuild the very blocks the forward's
+    context just released (same sizes, same stream), which still hold the forward's bytes. MoK's
+    context data (FP8, BF16) and E8M0 scales (uint8) never hold these values in a written row.
+    """
+    if not _fill_covers_mok_context_dtypes():
+        warnings.warn(
+            "this torch cannot fill new FP8 tensors deterministically; MoK's rebuilt contexts "
+            "are compared without poisoning the memory they reuse"
+        )
+        yield
+        return
+    with _deterministic_fill():
+        yield
+
+
 def _context_valid_views(context, schedule, macrobatch_size: int) -> dict[str, torch.Tensor]:
     """Copy the rows MoK writes of every context tensor (MoK's backward reuses the buffers).
 
@@ -199,6 +253,7 @@ def _context_valid_views(context, schedule, macrobatch_size: int) -> dict[str, t
     written or read and are excluded, as in MoK's own forward/recompute equality test.
     """
     rows = fc1_layout.valid_context_rows(int(schedule.num_tokens.item()), macrobatch_size)
+    assert rows > 0, "MoK routed no rows here; the context comparison would be vacuous"
     blocks = rows // fc1_layout.SCALE_BLOCK_ROWS
     views = {}
     for name, transposed in (
@@ -358,7 +413,8 @@ def test_packed_fc1_rebuild_equals_forward_context(precision, activation, macrob
         assert _context_nbytes(forward_context) == fc1_layout.routed_forward_context_nbytes(
             macrobatch_size, HIDDEN, FFN, mxfp8=precision == "mxfp8"
         )
-        del forward_context
+        # forward_context stays alive until the comparison is done, so the rebuild cannot be
+        # handed its blocks (which hold the very bytes it should write).
 
         gate, up = pack_fc1_gate_up(payloads, scales, FFN)
         gate_data, up_data = (gate[0], up[0]) if precision == "mxfp8" else (gate, up)
@@ -372,13 +428,15 @@ def test_packed_fc1_rebuild_equals_forward_context(precision, activation, macrob
                 _assert_bitwise_equal(gate[1][rows], scale[:blocks], f"packed gate scale {expert}")
                 _assert_bitwise_equal(up[1][rows], scale[blocks:], f"packed up scale {expert}")
 
-        rebuilt = functional.recompute_forward_context(
-            config, workspace, schedule, x, None, None, gate, up, **activation_kwargs
-        )
+        with _poisoned_new_allocations():
+            rebuilt = functional.recompute_forward_context(
+                config, workspace, schedule, x, None, None, gate, up, **activation_kwargs
+            )
         actual = _context_valid_views(rebuilt, schedule, macrobatch_size)
         assert actual.keys() == expected.keys()
         for name, tensor in expected.items():
             _assert_bitwise_equal(actual[name], tensor, name)
+        del forward_context, rebuilt
     finally:
         functional.clear_workspace_cache()
 
@@ -525,7 +583,8 @@ def _run(functional, backend, parameters, inputs, *, rebuild, checkpointed=False
 
     def rebuild_spy(*args, **kwargs):
         calls["rebuild"] += 1
-        return real_rebuild(*args, **kwargs)
+        with _poisoned_new_allocations():
+            return real_rebuild(*args, **kwargs)
 
     def backward_spy(config, workspace, schedule, forward_context, *args, **kwargs):
         captured["views"] = _context_valid_views(forward_context, schedule, config.macrobatch_size)
@@ -580,6 +639,7 @@ def _assert_same_results(actual, expected, what: str) -> None:
     """Bitwise comparison of two runs' ``results`` (a _Run or a _PipelineRun)."""
     assert actual.results.keys() == expected.results.keys()
     for name, tensor in expected.results.items():
+        assert tensor.count_nonzero() > 0, f"{what}: {name} is all zeros, the check is vacuous"
         _assert_bitwise_equal(actual.results[name], tensor, f"{what}: {name}")
 
 
@@ -631,15 +691,16 @@ def test_option_is_bitwise_identical_and_drops_the_context(
         off = _run(functional, backend, parameters, inputs, rebuild=False)
         _assert_same_results(off, warmup, "option off, rerun (MoK determinism)")
         on = _run(functional, backend, parameters, inputs, rebuild=True)
-        _assert_same_results(on, off, "option on vs off")
 
         assert off.rebuilds == 0 and off.forward_context_kept
         assert on.rebuilds == 1 and on.forward_context_kept is False
         # The context MoK's backward consumed with the option on is the rebuilt one; it equals
-        # the context forward kept with the option off on every row MoK wrote.
+        # the context forward kept with the option off on every row MoK wrote. Checked before the
+        # gradients: if the rows match but gradients do not, backward read rows MoK never wrote.
         assert on.backward_views.keys() == off.forward_views.keys()
         for name, tensor in off.forward_views.items():
             _assert_bitwise_equal(on.backward_views[name], tensor, f"rebuilt context {name}")
+        _assert_same_results(on, off, "option on vs off")
 
         # Forward keeps exactly the context's bytes less: 13,200 B per macrobatch row at the
         # Kimi-K3 shape in MXFP8, (H + 3 I) * 33 / 32 in general, plus a fused shared expert's
@@ -738,7 +799,8 @@ def _run_pipeline(functional, layers, microbatches, *, rebuild) -> _PipelineRun:
 
     def rebuild_spy(*args, **kwargs):
         calls["rebuild"] += 1
-        return real_rebuild(*args, **kwargs)
+        with _poisoned_new_allocations():
+            return real_rebuild(*args, **kwargs)
 
     in_flight, results = {}, {}
 
@@ -783,18 +845,28 @@ def _run_pipeline(functional, layers, microbatches, *, rebuild) -> _PipelineRun:
 
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
+    "macrobatch_size",
+    [
+        pytest.param(MULTI_MACROBATCH, id="multi_macrobatch"),
+        # Kimi-K3's mode: one macrobatch holds every routed row, so MoK's backward replays none
+        # and reads every row from the rebuilt context.
+        pytest.param(SINGLE_MACROBATCH, id="single_macrobatch"),
+    ],
+)
+@pytest.mark.parametrize(
     ("precision", "activation"),
     [pytest.param("mxfp8", "situ", id="mxfp8-situ"), pytest.param("bf16", "silu", id="bf16-silu")],
 )
 def test_option_is_bitwise_identical_across_interleaved_layers_and_microbatches(
-    precision, activation
+    precision, activation, macrobatch_size
 ):
     """Two chained MoE layers share MoK's workspace; three microbatches run in 1F1B order with
     two in flight. Option on and off must give bitwise-identical outputs and gradients, and the
-    option must keep exactly the in-flight contexts' bytes less."""
+    option must keep exactly the in-flight contexts' bytes less. Between a layer's forward and
+    its rebuild, other layers and microbatches reuse the memory its context released."""
     functional = _require_mok_layer(False)
     try:
-        layers = _build_mok_layers(precision, activation, MULTI_MACROBATCH, None, False, count=2)
+        layers = _build_mok_layers(precision, activation, macrobatch_size, None, False, count=2)
         microbatches = _pipeline_inputs(layers[0][0].config.num_moe_experts, len(layers))
 
         # The first run builds MoK's workspace and MCore's cached weight views; the second checks
@@ -812,7 +884,7 @@ def test_option_is_bitwise_identical_across_interleaved_layers_and_microbatches(
             _PIPELINE_IN_FLIGHT
             * len(layers)
             * fc1_layout.routed_forward_context_nbytes(
-                MULTI_MACROBATCH, HIDDEN, FFN, mxfp8=precision == "mxfp8"
+                macrobatch_size, HIDDEN, FFN, mxfp8=precision == "mxfp8"
             )
         )
         contexts = _PIPELINE_IN_FLIGHT * len(layers)
@@ -845,6 +917,42 @@ def test_checkpoint_replay_keeps_the_context():
         plain = _run(functional, backend, parameters, inputs, rebuild=True)
         assert plain.rebuilds == 1
         _assert_same_results(plain, off, "uncheckpointed option on vs checkpointed off")
+    finally:
+        functional.clear_workspace_cache()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+def test_parity_checks_catch_a_rebuild_from_swapped_gate_and_up(monkeypatch):
+    """Control for the checks above: a rebuild from a wrong FC1 pack must fail them.
+
+    Swapping the packed gate and up rebuilds a context that differs from the dropped one, so
+    both the rebuilt-context comparison and the gradients must tell the option apart from the
+    default. K3's mode: MXFP8 split weights, SiTU-GLU, one macrobatch.
+    """
+    functional = _require_mok_layer(False)
+    from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
+
+    try:
+        layer, backend, parameters = _build_mok_layer(
+            "mxfp8", "situ", SINGLE_MACROBATCH, None, False
+        )
+        inputs = _layer_inputs(layer.config.num_moe_experts)
+        _run(functional, backend, parameters, inputs, rebuild=False)
+        off = _run(functional, backend, parameters, inputs, rebuild=False)
+        # The backend calls pack_fc1_gate_up by the name it imported.
+        real_pack = mok_backend.pack_fc1_gate_up
+        monkeypatch.setattr(
+            mok_backend,
+            "pack_fc1_gate_up",
+            lambda *args, **kwargs: real_pack(*args, **kwargs)[::-1],
+        )
+        swapped = _run(functional, backend, parameters, inputs, rebuild=True)
+        assert swapped.rebuilds == 1
+        assert not torch.equal(
+            swapped.backward_views["gate_routed"], off.forward_views["gate_routed"]
+        )
+        assert not torch.equal(_bits(swapped.results["x.grad"]), _bits(off.results["x.grad"]))
     finally:
         functional.clear_workspace_cache()
         Utils.destroy_model_parallel()
