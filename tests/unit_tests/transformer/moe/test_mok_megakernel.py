@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -959,3 +960,63 @@ def test_split_fc1_payload_record_follows_the_weight_view_cache(monkeypatch, use
     module.to(torch.bfloat16)  # _apply invalidates the views derived from the parameters.
     assert module._routed_weight_view_cache is None
     assert module._routed_fc1_payload_record is None
+
+
+def test_forward_context_release_is_logged_once(monkeypatch):
+    """The first forward that releases a context to be rebuilt logs one line per process.
+
+    The no-grad first pass of a reentrant activation checkpoint (no backward follows) and its
+    replay inside backward (which keeps its context) do not log, nor does a layer with the option
+    off; the line names the routed context's size from MOK's macrobatch_size.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    from megatron.core.transformer.moe.megakernel.mok.fc1_layout import (
+        routed_forward_context_nbytes,
+    )
+
+    # The MOK stand-in's recompute_forward_context fails if called: no call below rebuilds.
+    module, functional = _routed_only_rebuild_backend(monkeypatch, single_grouped=True)
+    module.mok_config.macrobatch_size = 256
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    functional.forward = lambda *args, **kwargs: (args[3].clone(), object())
+    functional.backward = lambda *args, **kwargs: (
+        torch.ones_like(args[5]),
+        torch.ones_like(args[6]),
+        *kwargs["main_grads"],
+    )
+    logged = []
+    monkeypatch.setattr(mok_runtime, "_forward_context_release_logged", False)
+    monkeypatch.setattr(
+        mok_runtime,
+        "log_single_rank",
+        lambda logger, level, msg, *args: logged.append((logger, level, msg % args)),
+    )
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+
+    output = checkpoint(
+        lambda hidden, router_probs: module(hidden, router_probs, experts),
+        x,
+        probs,
+        use_reentrant=True,
+    )
+    output.backward(torch.ones_like(output))
+    assert logged == []
+
+    module.recompute_forward_context = False
+    module(x, probs, experts)
+    assert logged == []
+
+    module.recompute_forward_context = True
+    for _ in range(2):
+        module(x, probs, experts)
+    ((logger, level, message),) = logged
+    assert logger is mok_runtime.logger and level == logging.INFO
+    context_gib = (
+        routed_forward_context_nbytes(
+            256, module.hidden_size, module.intermediate_size, mxfp8=False
+        )
+        / 2**30
+    )
+    assert "(moe_mok_recompute_forward_context) is active" in message
+    assert f"(routed part: 256 rows, {context_gib:.2f} GiB per layer and microbatch)" in message

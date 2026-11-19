@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
+from megatron.core._rank_utils import log_single_rank
+from megatron.core.transformer.moe.megakernel.mok.fc1_layout import routed_forward_context_nbytes
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
 )
@@ -16,6 +19,12 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+
+logger = logging.getLogger(__name__)
+
+# Whether this process has logged that moe_mok_recompute_forward_context released a forward
+# context; the confirmation is logged once per run, not per layer and microbatch.
+_forward_context_release_logged = False
 
 
 def _gate_up_weight_arguments(shared_fc1: torch.Tensor | None, routed_fc1, intermediate_size: int):
@@ -60,6 +69,42 @@ def _in_autograd_backward() -> bool:
     and backpropagates the replayed region right after it.
     """
     return torch._C._current_graph_task_id() != -1
+
+
+def _log_first_forward_context_release(module: "MoKMegakernel") -> None:
+    """Log once per process, on the default log rank, that forward released MOK's context.
+
+    Confirms in the run log that moe_mok_recompute_forward_context acts at runtime: a MoE
+    forward that autograd will backpropagate released its MOK forward context, which the layer
+    rebuilds right before its backward. Host-side only; later calls return at once.
+    """
+    global _forward_context_release_logged
+    if _forward_context_release_logged:
+        return
+    _forward_context_release_logged = True
+    macrobatch_size = getattr(module.mok_config, "macrobatch_size", None)
+    try:
+        context_bytes = routed_forward_context_nbytes(
+            macrobatch_size,
+            module.hidden_size,
+            module.intermediate_size,
+            mxfp8=module.use_mxfp8_weights,
+        )
+        size = (
+            f"routed part: {macrobatch_size} rows, {context_bytes / 2**30:.2f} GiB per layer "
+            "and microbatch"
+        )
+    except ValueError:
+        # No valid macrobatch_size in the MOK config: confirm the release without its size.
+        size = "size unknown"
+    log_single_rank(
+        logger,
+        logging.INFO,
+        "MOK forward-context recompute (moe_mok_recompute_forward_context) is active: MoE "
+        "forward released MOK's forward context (%s), and each layer rebuilds it right before "
+        "its backward. Logged once, at the first release.",
+        size,
+    )
 
 
 def _rebuild_forward_context(
@@ -195,6 +240,10 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.rebuild_forward_context = rebuild_forward_context
         ctx.forward_context = None if rebuild_forward_context else forward_context
+        if rebuild_forward_context and any(ctx.needs_input_grad):
+            # Only a forward that autograd records gets a backward, and so a rebuild (the
+            # no-grad first pass of an activation checkpoint has neither).
+            _log_first_forward_context_release(module)
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2
