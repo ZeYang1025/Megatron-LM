@@ -1452,7 +1452,8 @@ class TransformerConfig(ModelParallelConfig):
     and summed in FP32 straight into main_grad, with the same 1/GTP mean scaling. It runs
     synchronously, also where the reduce-scatter would otherwise overlap (the MTP stage), in
     hidden-dim chunks whose scratch is capped at 512 MiB and freed after the call; no buffer stays
-    allocated. No effect without GTP or when the gradient is already FP32.
+    allocated. No effect without GTP or when the gradient is already FP32 (FP32 params);
+    VocabParallelEmbedding warns in both cases.
     --gtp-remat-reduce-scatter-with-fp32-accumulation is no substitute with FP32 main grads,
     because the training arguments turn it off then.
     """

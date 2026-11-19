@@ -418,7 +418,9 @@ the matching `main_grad` columns.
   FP32 sum per chunk. It is always synchronous: on a stage where the embedding's reduce-scatter
   was async (the MTP stage) it is no longer overlapped with the rest of the backward.
 - **Scope.** Only weights tagged `_wgrad_reduce_in_fp32` (the GTP embedding, by
-  `VocabParallelEmbedding`) with a BF16/FP16 wgrad; FP32 wgrads keep the ordinary path.
+  `VocabParallelEmbedding`) with a BF16/FP16 wgrad; FP32 wgrads keep the ordinary path. Without
+  dense GTP, or with FP32 params, the flag has no effect and `VocabParallelEmbedding` warns once
+  (rank 0).
 
 ### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
 

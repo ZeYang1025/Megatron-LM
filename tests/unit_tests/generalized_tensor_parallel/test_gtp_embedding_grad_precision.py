@@ -12,6 +12,8 @@ Four ranks on one node:
         tests/unit_tests/generalized_tensor_parallel/test_gtp_embedding_grad_precision.py
 """
 
+import warnings
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -21,6 +23,7 @@ import torch.distributed as dist  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module  # noqa: E402
+from megatron.core._rank_utils import get_default_log_ranks  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPEmbeddingWeight,
@@ -201,11 +204,15 @@ def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32
             num_attention_heads=1,
             params_dtype=torch.bfloat16,
             perform_initialization=False,
+            tensor_parallel_num_weight_shards=WORLD_SIZE,
             gtp_embedding_wgrad_fp32=fp32_embedding_wgrad,
         )
-        embedding = VocabParallelEmbedding(
-            num_rows, HIDDEN, init_method=torch.nn.init.zeros_, config=config
-        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            embedding = VocabParallelEmbedding(
+                num_rows, HIDDEN, init_method=torch.nn.init.zeros_, config=config
+            )
+        assert not [w for w in caught if "gtp_embedding_wgrad_fp32" in str(w.message)]
         weight = embedding.weight
         assert gtp_module.is_gtp_param(weight)
         assert weight._wgrad_reduce_in_fp32 is fp32_embedding_wgrad
@@ -224,6 +231,44 @@ def test_vocab_parallel_embedding_wires_the_config_flag(restore_gtp_config, fp32
             torch.testing.assert_close(weight.main_grad, wanted, rtol=0, atol=0)
         else:
             assert not torch.equal(weight.main_grad, wanted)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        Utils.initialize_model_parallel()
+
+
+@pytest.mark.parametrize("case", ["gtp_off", "fp32_params"])
+def test_flag_warns_where_it_has_no_effect(restore_gtp_config, case):
+    """gtp_embedding_wgrad_fp32 does nothing without a GTP group to reduce over, or for FP32
+    weights (their gradient already reduces in FP32). VocabParallelEmbedding, which decides
+    whether the embedding is GTP-sharded, says so once per job (on the default log rank)."""
+    _require_four_ranks()
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    gtp = case == "fp32_params"
+    Utils.initialize_model_parallel(gtp_remat_size=WORLD_SIZE if gtp else 1)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=1,
+            params_dtype=torch.float32 if gtp else torch.bfloat16,
+            perform_initialization=False,
+            tensor_parallel_num_weight_shards=WORLD_SIZE if gtp else None,
+            gtp_embedding_wgrad_fp32=True,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            embedding = VocabParallelEmbedding(
+                16, HIDDEN, init_method=torch.nn.init.zeros_, config=config
+            )
+        assert bool(gtp_module.is_gtp_param(embedding.weight)) is gtp
+        no_effect = [
+            w for w in caught if "gtp_embedding_wgrad_fp32 has no effect" in str(w.message)
+        ]
+        expected = 1 if dist.get_rank() in get_default_log_ranks() else 0
+        assert len(no_effect) == expected, [str(w.message) for w in caught]
     finally:
         torch.cuda.synchronize()
         dist.barrier()
