@@ -662,6 +662,22 @@ Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`.
 per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
 static input token counts alone do not establish that lifecycle.
 
+Without MoE-layer recompute, MOK keeps a forward context from each MoE forward to its backward:
+FP8 copies of the first macrobatch's dispatched input, gate, up and activation output, sized by
+`macrobatch_size` at `(H + 3 * I) * 33 / 32` bytes per row in MXFP8 (1.61 GiB per layer and
+microbatch for Kimi-K3's latent `H = 3584`, `I = 3072` at the default 131072 rows).
+`--moe-mok-recompute-forward-context` releases that context after forward and rebuilds it right
+before the layer's backward with MOK's `functional.recompute_forward_context` (MOK d59188a or
+newer). The rebuild reruns only dispatch, routed FC1 and the activation for that macrobatch, not
+the router, latent projections, FC2 or combine. Because the rebuild op accepts only contiguous
+gate/up weights, MCore packs each expert's combined FC1 rows (and MXFP8 scale blocks) into a
+transient `[E, I, H]` copy for its duration. The rebuild is an EP collective that runs inside the
+MOK autograd node's backward, so it keeps MOK's existing EP ordering, and gradients are bitwise
+identical to the default. MOK calls that an activation checkpoint replays (`moe` in
+`recompute_modules`, full recompute) keep their context instead. The option supports BF16 and
+MXFP8, both routed weight layouts, and MOK-fused ungated shared experts; MOK cannot rebuild a
+gated fused shared expert's context, so that combination is rejected.
+
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
 wgrad, native shared-expert overlap, fused shared-expert-only

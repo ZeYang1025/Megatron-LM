@@ -23,6 +23,8 @@ from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
+    pack_fc1_gate_up,
+    routed_fc1_expert_views,
 )
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
@@ -148,6 +150,12 @@ class MoKMegakernel(MegakernelBackend):
                 shared_experts, use_output_gate=config.moe_shared_expert_gate
             )
 
+        # moe_mok_recompute_forward_context: drop MOK's saved forward context after forward and
+        # rebuild it right before backward. Read at forward time, so it can be changed per layer.
+        self.recompute_forward_context = bool(config.moe_mok_recompute_forward_context)
+        if self.recompute_forward_context:
+            self._check_forward_context_rebuild_support()
+
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
@@ -212,6 +220,50 @@ class MoKMegakernel(MegakernelBackend):
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients."""
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
+
+    def _check_forward_context_rebuild_support(self) -> None:
+        """Fail at construction if MOK cannot rebuild this layer's forward context."""
+        import inspect
+
+        from mok import functional
+
+        rebuild = getattr(functional, "recompute_forward_context", None)
+        if rebuild is None:
+            raise ImportError(
+                "moe_mok_recompute_forward_context needs mok.functional.recompute_forward_context, "
+                "which the installed mixture-of-kittens lacks; install a MOK build that has it "
+                "(e.g. d59188a) or disable --moe-mok-recompute-forward-context"
+            )
+        if self.situ_beta is not None and "situ_beta" not in inspect.signature(rebuild).parameters:
+            raise ImportError(
+                "moe_mok_recompute_forward_context with SiTU-GLU needs a MOK whose "
+                "recompute_forward_context accepts situ_beta; the installed MOK does not"
+            )
+        if self.shared_output_gate_weight is not None:
+            # MOK's rebuild is ungated: it cannot recreate the gated shared output S and gate G
+            # that a gated backward consumes.
+            raise ValueError(
+                "moe_mok_recompute_forward_context does not support a MOK-fused gated shared "
+                "expert (moe_shared_expert_gate); set shared_expert_mode to 'native' in "
+                "moe_megakernel_backend_config or disable the option"
+            )
+
+    def routed_fc1_recompute_weights(self, fc1_weight_view):
+        """Return routed FC1 packed into the contiguous gate/up layout MOK's rebuild accepts.
+
+        The packed tensors are transient copies (``2 * E * I * H`` payload bytes); the caller
+        drops them as soon as the rebuild is enqueued.
+        """
+        payloads, scales = routed_fc1_expert_views(
+            fc1_weight_view,
+            self.routed_fc1_parameters,
+            num_experts=self.num_local_experts,
+            intermediate_size=self.intermediate_size,
+            hidden_size=self.hidden_size,
+            use_mxfp8=self.use_mxfp8_weights,
+            single_grouped=self.native_single_grouped_weights,
+        )
+        return pack_fc1_gate_up(payloads, scales, self.intermediate_size)
 
     @torch.no_grad()
     def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
