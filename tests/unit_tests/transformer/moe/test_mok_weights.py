@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -267,6 +268,97 @@ def test_mok_accepts_dense_gtp_with_native_shared_experts(overrides):
 def test_mok_rejects_gtp_on_weights_the_megakernel_reads(overrides, error):
     with pytest.raises(ValueError, match=error):
         _mok_transformer_config(**overrides)
+
+
+def _stub_mok(monkeypatch):
+    """Stand in for mok.functional, so the adapter can be constructed without MOK."""
+    package = ModuleType("mok")
+    functional = ModuleType("mok.functional")
+    functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    package.functional = functional
+    monkeypatch.setitem(sys.modules, "mok", package)
+    monkeypatch.setitem(sys.modules, "mok.functional", functional)
+
+
+def _native_expert_modules(config, num_local_experts=2):
+    """Per-expert routed weights and a gated combined shared MLP, shaped as MCore builds them."""
+    hidden, ffn = config.hidden_size, config.moe_ffn_hidden_size
+
+    def linear(**weights):
+        module = torch.nn.Module()
+        module.single_grouped_weight = False
+        for name, shape in weights.items():
+            module.register_parameter(
+                name, torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
+            )
+        return module
+
+    experts = torch.nn.Module()
+    indices = range(num_local_experts)
+    experts.linear_fc1 = linear(**{f"weight{i}": (2 * ffn, hidden) for i in indices})
+    experts.linear_fc2 = linear(**{f"weight{i}": (hidden, ffn) for i in indices})
+    shared = torch.nn.Module()
+    shared.linear_fc1 = linear(weight=(2 * ffn, hidden))
+    shared.linear_fc2 = linear(weight=(hidden, ffn))
+    shared.register_parameter(
+        "gate_weight", torch.nn.Parameter(torch.zeros((1, hidden), dtype=torch.bfloat16))
+    )
+    return experts, shared
+
+
+def _gtp_shard(module, rows):
+    """Replace ``module.weight`` with a GTP_remat shard: fewer rows, tagged like GTP tags it."""
+    full = module.weight
+    module.weight = torch.nn.Parameter(torch.zeros((rows, full.shape[1]), dtype=full.dtype))
+    module.weight.is_gtp_weight_remat = True
+
+
+@pytest.mark.parametrize(
+    "sharded_input",
+    [
+        "routed_fc1_weight1",
+        "routed_fc2_weight0",
+        "shared_fc1_weight",
+        "shared_fc2_weight",
+        "shared_output_gate_weight",
+    ],
+)
+def test_mok_backend_rejects_gtp_sharded_inputs(monkeypatch, sharded_input):
+    """The adapter refuses GTP shards even if a process-group collection disagrees with the
+    config, because the megakernel reads its registered weights without gathering them. A
+    shared-weight shard also has the wrong shape, so the GTP error must come first."""
+    from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+
+    _stub_mok(monkeypatch)
+    config = _mok_transformer_config(moe_shared_expert_gate=True)
+    experts, shared = _native_expert_modules(config)
+    if sharded_input.startswith("routed_"):
+        fc = experts.linear_fc1 if "_fc1_" in sharded_input else experts.linear_fc2
+        fc.get_parameter("weight" + sharded_input[-1]).is_gtp_weight_remat = True
+    elif sharded_input == "shared_fc1_weight":
+        _gtp_shard(shared.linear_fc1, config.moe_ffn_hidden_size)  # [2I/2, H] at GTP 2
+    elif sharded_input == "shared_fc2_weight":
+        _gtp_shard(shared.linear_fc2, config.hidden_size // 2)  # [H/2, I] at GTP 2
+    else:
+        shared.gate_weight.is_gtp_weight_remat = True
+
+    with pytest.raises(ValueError, match=f"GTP-sharded MOK inputs: \\['{sharded_input}'\\]"):
+        MoKMegakernel(config, object(), experts, shared, 2)
+
+
+def test_mok_backend_accepts_unsharded_inputs(monkeypatch):
+    """The same inputs build the adapter when no weight it reads is a GTP shard."""
+    from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
+
+    _stub_mok(monkeypatch)
+    config = _mok_transformer_config(moe_shared_expert_gate=True)
+    experts, shared = _native_expert_modules(config)
+
+    module = MoKMegakernel(config, object(), experts, shared, 2)
+
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_output_gate_weight is shared.gate_weight
+    assert len(module.autograd_routed_parameters) == 4
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
