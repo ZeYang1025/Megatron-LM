@@ -71,15 +71,24 @@ def _in_autograd_backward() -> bool:
     return torch._C._current_graph_task_id() != -1
 
 
-def _log_first_forward_context_release(module: "MoKMegakernel") -> None:
+def _log_first_forward_context_release(module: "MoKMegakernel", output: torch.Tensor) -> None:
     """Log once per process, on the default log rank, that forward released MOK's context.
 
     Confirms in the run log that moe_mok_recompute_forward_context acts at runtime: a MoE
-    forward that autograd will backpropagate released its MOK forward context, which the layer
-    rebuilds right before its backward. Host-side only; later calls return at once.
+    forward that autograd recorded released its MOK forward context, which the layer rebuilds
+    right before its backward. ``output`` is what ``_MoKAutograd.apply`` returned. Only a call
+    that autograd recorded has a ``grad_fn`` (the MOK autograd node), so the no-grad first pass
+    of an activation checkpoint and an inference forward do not log; inside forward,
+    ``ctx.needs_input_grad`` cannot tell them apart, because it describes the inputs, and MOK's
+    parameters require grad in those passes too. A call that a checkpoint replays inside
+    backward keeps its context (``rebuild_forward_context`` is False on its node) and does not
+    log either. Host-side only; later calls return at once.
     """
     global _forward_context_release_logged
     if _forward_context_release_logged:
+        return
+    node = output.grad_fn
+    if node is None or not getattr(node, "rebuild_forward_context", False):
         return
     _forward_context_release_logged = True
     macrobatch_size = getattr(module.mok_config, "macrobatch_size", None)
@@ -240,10 +249,6 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.rebuild_forward_context = rebuild_forward_context
         ctx.forward_context = None if rebuild_forward_context else forward_context
-        if rebuild_forward_context and any(ctx.needs_input_grad):
-            # Only a forward that autograd records gets a backward, and so a rebuild (the
-            # no-grad first pass of an activation checkpoint has neither).
-            _log_first_forward_context_release(module)
         ctx.routed_weight_views = (fc1_weight_view, fc2_weight_view)
         ctx.save_for_backward(
             x, router_weights, shared_output_gate_weight, *routed_parameters, shared_fc1, shared_fc2

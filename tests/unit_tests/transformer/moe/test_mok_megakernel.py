@@ -966,8 +966,9 @@ def test_forward_context_release_is_logged_once(monkeypatch):
     """The first forward that releases a context to be rebuilt logs one line per process.
 
     The no-grad first pass of a reentrant activation checkpoint (no backward follows) and its
-    replay inside backward (which keeps its context) do not log, nor does a layer with the option
-    off; the line names the routed context's size from MOK's macrobatch_size.
+    replay inside backward (which keeps its context) do not log, nor does an inference forward
+    under no_grad (whose MOK parameters still require grad) or a layer with the option off; the
+    line names the routed context's size from MOK's macrobatch_size.
     """
     from torch.utils.checkpoint import checkpoint
 
@@ -1001,6 +1002,11 @@ def test_forward_context_release_is_logged_once(monkeypatch):
         use_reentrant=True,
     )
     output.backward(torch.ones_like(output))
+    assert logged == []
+
+    with torch.no_grad():
+        assert all(parameter.requires_grad for parameter in module.parameters())
+        module(x, probs, experts)
     assert logged == []
 
     module.recompute_forward_context = False

@@ -19,7 +19,10 @@ from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
-from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
+from megatron.core.transformer.moe.megakernel.mok.runtime import (
+    _log_first_forward_context_release,
+    _MoKAutograd,
+)
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
     _native_split_weight_view,
@@ -514,4 +517,6 @@ class MoKMegakernel(MegakernelBackend):
             self.shared_fc1_weight,
             self.shared_fc2_weight,
         )
+        if self.recompute_forward_context:
+            _log_first_forward_context_release(self, output)
         return output.view(original_shape)
