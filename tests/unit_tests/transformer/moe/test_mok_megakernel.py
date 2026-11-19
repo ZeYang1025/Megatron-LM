@@ -654,3 +654,266 @@ def test_runtime_requires_output_gate_main_grad(monkeypatch):
     functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
     with pytest.raises(RuntimeError, match="DDP to assign param.main_grad"):
         mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
+
+
+# moe_mok_recompute_forward_context wiring with MOK mocked. The GPU tests that run MOK itself
+# (bitwise parity, memory, interleaved layers and microbatches) are in
+# test_mok_recompute_forward_context.py.
+
+
+def _rebuild_call_inputs(monkeypatch, hidden_size=8):
+    """Inputs for one adapter call, routed with the probabilities the adapter receives."""
+    x = torch.zeros((4, hidden_size), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), dtype=torch.float32, requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    # Use the probabilities passed in (an activation checkpoint passes a detached copy).
+    monkeypatch.setattr(
+        mok_backend,
+        "routing_map_to_mok_inputs",
+        lambda router_probs, routing_map, topk: (router_probs, routing_map),
+    )
+    return x, probs, experts
+
+
+def test_forward_context_rebuild_switch_checks_mok_support(monkeypatch):
+    module, _, functional = _mock_backend(monkeypatch, gated=None, situ=True, routed_only=True)
+    assert module.recompute_forward_context is False
+    # Switching the option on for one layer runs the checks construction runs with it on.
+    with pytest.raises(ImportError, match="lacks"):
+        module.recompute_forward_context = True
+    assert module.recompute_forward_context is False
+
+    def rebuild_without_situ(
+        config,
+        workspace,
+        schedule,
+        x,
+        shared_gate_weights,
+        shared_up_weights,
+        routed_gate_weights,
+        routed_up_weights,
+        swiglu_limit=None,
+    ):
+        raise AssertionError("unreachable")
+
+    functional.recompute_forward_context = rebuild_without_situ
+    with pytest.raises(ImportError, match="situ_beta"):
+        module.recompute_forward_context = True
+    assert module.recompute_forward_context is False
+
+    functional.recompute_forward_context = _unexpected_forward_context_rebuild
+    module.recompute_forward_context = True
+    assert module.recompute_forward_context is True
+    module.recompute_forward_context = False
+    assert module.recompute_forward_context is False
+
+
+def test_forward_context_rebuild_rejects_gated_shared_expert_before_mok_runs(monkeypatch):
+    module, shared, functional = _mock_backend(
+        monkeypatch, gated=False, recompute_forward_context=True
+    )
+    assert module.recompute_forward_context and module.shared_output_gate_weight is None
+    # A gate attached after the option was switched on: forward fails before any MOK call (each
+    # one an EP collective), so no EP rank enters MOK's barriers.
+    shared.gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16))
+    module._register_shared_weights(shared, use_output_gate=True)
+    calls = []
+    functional.get_workspace = functional.build_schedule = functional.forward = (
+        lambda *args, **kwargs: calls.append(args)
+    )
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+    with pytest.raises(RuntimeError, match="cannot rebuild a gated forward context"):
+        module(x, probs, experts)
+    assert calls == []
+
+    module.recompute_forward_context = False
+    with pytest.raises(ValueError, match="gated shared expert"):
+        module.recompute_forward_context = True
+
+
+def _routed_only_rebuild_backend(monkeypatch, *, single_grouped, situ=False):
+    """A routed-only BF16 adapter with the option on, distinct FC1 values and CPU weight views."""
+    module, _, functional = _mock_backend(
+        monkeypatch,
+        single_grouped=single_grouped,
+        gated=None,
+        situ=situ,
+        routed_only=True,
+        recompute_forward_context=True,
+    )
+    with torch.no_grad():
+        # Values below 256 are exact in BF16, so every FC1 element stays distinct.
+        offset = 0
+        for parameter in module.routed_fc1_parameters:
+            values = torch.arange(offset, offset + parameter.numel(), dtype=torch.float32)
+            parameter.copy_(values.view(parameter.shape))
+            offset += parameter.numel()
+    for parameter in module.parameters():
+        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+        parameter.grad_added_to_main_grad = False
+    if not single_grouped:
+
+        def split_view(params, *, rows, columns, use_mxfp8, cached_view=None):
+            assert not use_mxfp8 and cached_view is None
+            # MOK's SplitRoutedWeight keeps expert 0's payload as its representative tensor.
+            return SimpleNamespace(data=params[0], scale_tensors=None)
+
+        monkeypatch.setattr(mok_backend, "_native_split_weight_view", split_view)
+        monkeypatch.setattr(
+            mok_weights, "_storage_view", lambda storage, shape, *, dtype, name: storage.view(shape)
+        )
+    return module, functional
+
+
+def _expected_gate_up(module):
+    """Gate rows [0, I) and up rows [I, 2I) of every expert's combined FC1, as [E, I, H]."""
+    intermediate = module.intermediate_size
+    combined = torch.cat(
+        [
+            parameter.detach().reshape(-1, 2 * intermediate, module.hidden_size)
+            for parameter in module.routed_fc1_parameters
+        ]
+    )
+    return combined[:, :intermediate], combined[:, intermediate:]
+
+
+@pytest.mark.parametrize(
+    "single_grouped, situ", [(False, True), (True, False)], ids=["split-situ", "single-silu"]
+)
+def test_forward_context_rebuild_drops_context_and_packs_routed_fc1(
+    monkeypatch, single_grouped, situ
+):
+    module, functional = _routed_only_rebuild_backend(
+        monkeypatch, single_grouped=single_grouped, situ=situ
+    )
+    assert module.recompute_forward_context
+    workspace, schedule = object(), object()
+    forward_context, rebuilt_context = object(), object()
+    rebuilds, consumed = [], []
+    functional.get_workspace = lambda *args, **kwargs: workspace
+    functional.build_schedule = lambda *args, **kwargs: schedule
+
+    def forward(*args, **kwargs):
+        # Forward still passes MOK the combined FC1 view for both gate and up.
+        assert args[8] is args[9]
+        return args[3].clone(), forward_context
+
+    def recompute_forward_context(*args, **kwargs):
+        rebuilds.append((args, kwargs))
+        return rebuilt_context
+
+    def backward(*args, **kwargs):
+        consumed.append(args[3])
+        return (torch.ones_like(args[5]), torch.ones_like(args[6]), *kwargs["main_grads"])
+
+    functional.forward = forward
+    functional.recompute_forward_context = recompute_forward_context
+    functional.backward = backward
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+
+    output = module(x, probs, experts)
+    bridge = output.grad_fn.next_functions[0][0]
+    # Forward released MOK's context; nothing is rebuilt before backward.
+    assert bridge.rebuild_forward_context and bridge.forward_context is None
+    assert rebuilds == []
+    output.backward(torch.ones_like(output))
+
+    # MOK's backward consumed the rebuilt context.
+    assert consumed == [rebuilt_context]
+    ((args, kwargs),) = rebuilds
+    assert args[0] is module.mok_config and args[1] is workspace and args[2] is schedule
+    assert args[3].data_ptr() == x.data_ptr()
+    assert args[4] is None and args[5] is None  # Routed-only: no MOK-fused shared gate/up.
+    for packed, expected in zip(args[6:8], _expected_gate_up(module)):
+        assert packed.shape == (2, module.intermediate_size, module.hidden_size)
+        assert packed.is_contiguous()
+        torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+        # A transient copy, not a view of the MCore parameters.
+        assert all(
+            packed.untyped_storage().data_ptr() != parameter.untyped_storage().data_ptr()
+            for parameter in module.routed_fc1_parameters
+        )
+    assert kwargs == {"swiglu_limit": None, **({"situ_beta": (2.0, 8.0)} if situ else {})}
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+    assert all(parameter.grad_added_to_main_grad for parameter in module.parameters())
+    assert bridge.module is None and bridge.forward_context is None
+
+
+def test_forward_context_rebuild_skips_checkpoint_replays(monkeypatch):
+    """A call that an activation checkpoint replays inside backward keeps its context."""
+    from torch.utils.checkpoint import checkpoint
+
+    module, functional = _routed_only_rebuild_backend(monkeypatch, single_grouped=True)
+    contexts, consumed, rebuilds = [], [], []
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+
+    def forward(*args, **kwargs):
+        contexts.append(object())
+        return args[3].clone(), contexts[-1]
+
+    def backward(*args, **kwargs):
+        consumed.append(args[3])
+        return (torch.ones_like(args[5]), torch.ones_like(args[6]), *kwargs["main_grads"])
+
+    functional.forward = forward
+    functional.backward = backward
+    functional.recompute_forward_context = lambda *args, **kwargs: rebuilds.append(args)
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+
+    output = checkpoint(
+        lambda hidden, router_probs: module(hidden, router_probs, experts),
+        x,
+        probs,
+        use_reentrant=True,
+    )
+    assert len(contexts) == 1
+    output.backward(torch.ones_like(output))
+
+    # The replayed call kept its context, and MOK's backward consumed it without a rebuild.
+    assert len(contexts) == 2 and consumed == [contexts[1]]
+    assert rebuilds == []
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+
+
+def _fail_mok_backward(*args, **kwargs):
+    raise AssertionError("MOK's backward ran without a valid forward context")
+
+
+def test_forward_context_rebuild_rejects_moved_expert_payload(monkeypatch):
+    module, functional = _routed_only_rebuild_backend(monkeypatch, single_grouped=False)
+    rebuilds = []
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    functional.forward = lambda *args, **kwargs: (args[3].clone(), object())
+    functional.recompute_forward_context = lambda *args, **kwargs: rebuilds.append(args)
+    functional.backward = _fail_mok_backward
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+    output = module(x, probs, experts)
+
+    # Expert 1's payload is no longer where MOK's descriptor tables (built with the view, and
+    # read by forward) point; expert 0, the view's representative tensor, has not moved.
+    moved = module.routed_fc1_parameters[1]
+
+    def storage_view(storage, shape, *, dtype, name):
+        view = storage.view(shape)
+        return view.clone() if storage is moved else view
+
+    monkeypatch.setattr(mok_weights, "_storage_view", storage_view)
+    with pytest.raises(RuntimeError, match="payload of expert 1 moved"):
+        output.backward(torch.ones_like(output))
+    assert rebuilds == []
+
+
+def test_forward_context_rebuild_rejects_weights_reloaded_before_backward(monkeypatch):
+    module, functional = _routed_only_rebuild_backend(monkeypatch, single_grouped=False)
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    functional.forward = lambda *args, **kwargs: (args[3].clone(), object())
+    functional.backward = _fail_mok_backward
+    x, probs, experts = _rebuild_call_inputs(monkeypatch)
+    output = module(x, probs, experts)
+
+    # Loading weights invalidates the views and descriptors this microbatch's forward used.
+    module._load_from_state_dict({}, "", {}, True, [], [], [])
+    with pytest.raises(RuntimeError, match="no longer the cached one"):
+        output.backward(torch.ones_like(output))
