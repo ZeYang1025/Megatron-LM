@@ -133,11 +133,11 @@ def test_packed_fc1_reads_what_forward_reads(num_experts, intermediate_size, spl
             )
         for block in range(intermediate_size // QUANT_MB):
             for which, packed in (("gate", gate_scale), ("up", up_scale)):
-                assert _rebuild_scale_block(
-                    packed, expert, block, intermediate_size
-                ) == _forward_scale_block(
+                rebuilt = _rebuild_scale_block(packed, expert, block, intermediate_size)
+                forward = _forward_scale_block(
                     scale_storage, expert, block, which, intermediate_size, split
-                ), (which, expert, block)
+                )
+                assert rebuilt == forward, (which, expert, block)
 
 
 def test_k3_slices_and_shapes():
@@ -154,9 +154,11 @@ def test_k3_slices_and_shapes():
     )
     # The rebuild's transient packed FC1 copy at the K3 shape: ~0.32 GB in MXFP8.
     payload = 2 * K3_EXPERTS * K3_FFN * K3_HIDDEN
-    assert fc1_layout.packed_gate_up_nbytes(
-        K3_EXPERTS, K3_FFN, K3_HIDDEN, mxfp8=True
-    ) == payload + payload // 32 == 317_915_136
+    assert (
+        fc1_layout.packed_gate_up_nbytes(K3_EXPERTS, K3_FFN, K3_HIDDEN, mxfp8=True)
+        == payload + payload // 32
+        == 317_915_136
+    )
     assert fc1_layout.packed_gate_up_nbytes(K3_EXPERTS, K3_FFN, K3_HIDDEN, mxfp8=False) == (
         2 * payload
     )

@@ -364,9 +364,15 @@ def main() -> None:
         f"context GiB, rebuild s/step at {LAYERS} layers x {MICROBATCHES} microbatches, "
         f"saved s/step vs {MOE_RECOMPUTE_MS} ms MoE recompute",
     )
-    for macrobatch_size, forward_ms, pack_ms, recompute_ms, rebuild_ms, backward_ms, context in (
-        summary
-    ):
+    for (
+        macrobatch_size,
+        forward_ms,
+        pack_ms,
+        recompute_ms,
+        rebuild_ms,
+        backward_ms,
+        context,
+    ) in summary:
         per_step = rebuild_ms * LAYERS * MICROBATCHES / 1000
         saved = (MOE_RECOMPUTE_MS - rebuild_ms) * LAYERS * MICROBATCHES / 1000
         _log(

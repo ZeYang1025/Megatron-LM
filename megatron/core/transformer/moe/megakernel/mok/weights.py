@@ -426,9 +426,7 @@ def _split_rowwise_payload(
                 "MOK forward-context rebuild: a split MXFP8 routed FC1 parameter has no native "
                 f"TE rowwise payload (param_type={type(param).__name__})"
             )
-        return _storage_view(
-            storage, shape, dtype=torch.float8_e4m3fn, name="split MXFP8 rowwise"
-        )
+        return _storage_view(storage, shape, dtype=torch.float8_e4m3fn, name="split MXFP8 rowwise")
     return _storage_view(
         param if storage is None else storage,
         shape,
@@ -552,8 +550,10 @@ def pack_fc1_gate_up(
 
     gate_rows, up_rows = fc1_layout.gate_up_row_slices(intermediate_size)
     # torch.stack only moves bytes; an FP8 payload is stacked through its uint8 view.
-    sources = [payload.view(torch.uint8) for payload in expert_payloads] if is_mxfp8 else list(
-        expert_payloads
+    sources = (
+        [payload.view(torch.uint8) for payload in expert_payloads]
+        if is_mxfp8
+        else list(expert_payloads)
     )
     gate = torch.stack([source[gate_rows] for source in sources])
     up = torch.stack([source[up_rows] for source in sources])
