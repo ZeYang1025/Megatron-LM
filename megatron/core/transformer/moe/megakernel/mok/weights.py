@@ -414,6 +414,26 @@ def _native_split_weight_view(
     )
 
 
+def split_rowwise_payload_ptrs(
+    params: tuple[nn.Parameter, ...], *, use_mxfp8: bool
+) -> tuple[int | None, ...]:
+    """Addresses of the per-expert rowwise payloads ``_native_split_weight_view`` reads.
+
+    Recorded when MOK's descriptor tables are built from those payloads, so that the
+    forward-context rebuild can check that it packs every expert's payload from where MOK's
+    forward read it. Only reads attributes and addresses; None marks an MXFP8 parameter without
+    native TE rowwise storage, which the view build and the rebuild both reject.
+    """
+    ptrs = []
+    for param in params:
+        storage = _parameter_storage_attr(param, "rowwise_data")
+        if storage is not None:
+            ptrs.append(storage.data_ptr())
+        else:
+            ptrs.append(None if use_mxfp8 else param.data_ptr())
+    return tuple(ptrs)
+
+
 def _split_rowwise_payload(
     param: nn.Parameter, *, rows: int, columns: int, use_mxfp8: bool
 ) -> torch.Tensor:
@@ -444,6 +464,7 @@ def routed_fc1_expert_views(
     hidden_size: int,
     use_mxfp8: bool,
     single_grouped: bool,
+    descriptor_payload_ptrs: tuple[int | None, ...] | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...] | None]:
     """Return the per-expert combined FC1 payloads and scales that MOK's forward consumed.
 
@@ -459,6 +480,10 @@ def routed_fc1_expert_views(
         hidden_size: MoE hidden size ``H`` (the latent size for latent MoE).
         use_mxfp8: Whether routed weights are MXFP8.
         single_grouped: Whether routed FC1 is one single-grouped parameter.
+        descriptor_payload_ptrs: For split weights, the per-expert payload addresses that
+            ``split_rowwise_payload_ptrs`` recorded when the view's descriptor tables were built.
+            Every expert's payload must still be there. Unused for single-grouped weights, whose
+            view holds the payload itself.
     """
     rows = 2 * intermediate_size
     if single_grouped:
@@ -477,12 +502,26 @@ def routed_fc1_expert_views(
             _split_rowwise_payload(param, rows=rows, columns=hidden_size, use_mxfp8=use_mxfp8)
             for param in fc1_parameters
         )
-        # The forward read the payloads through descriptor tables built from these storages;
-        # repacking different storage would silently rebuild a different context.
+        # The forward read every expert through descriptor tables built from the payloads'
+        # addresses at the time; packing any other storage would silently rebuild a different
+        # context. Host-side checks only.
+        if descriptor_payload_ptrs is None or len(descriptor_payload_ptrs) != len(payloads):
+            raise RuntimeError(
+                "MOK forward-context rebuild needs the per-expert routed FC1 payload addresses "
+                "recorded when MOK's weight descriptors were built: got "
+                f"{None if descriptor_payload_ptrs is None else len(descriptor_payload_ptrs)} "
+                f"for {len(payloads)} experts"
+            )
+        for expert, (payload, recorded) in enumerate(zip(payloads, descriptor_payload_ptrs)):
+            if payload.data_ptr() != recorded:
+                raise RuntimeError(
+                    f"MOK forward-context rebuild: the routed FC1 payload of expert {expert} "
+                    "moved since MOK's weight descriptors were built"
+                )
         if payloads and payloads[0].data_ptr() != fc1_weight_view.data.data_ptr():
             raise RuntimeError(
-                "MOK forward-context rebuild: the routed FC1 payload of expert 0 moved since "
-                "MOK's weight descriptors were built"
+                "MOK forward-context rebuild: the routed FC1 payload of expert 0 is not the "
+                "representative payload of MOK's weight view"
             )
         scales = None
         if use_mxfp8:
