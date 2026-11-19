@@ -455,6 +455,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
             # via GTPEmbeddingWeight.backward.
             self.weight._need_weight_prefetch = False
+            # The lookup's autograd wgrad arrives in the param dtype, so by default it is
+            # reduce-scattered in BF16 even with FP32 main grads. Opt in to FP32 accumulation.
+            self.weight._wgrad_reduce_in_fp32 = bool(
+                getattr(config, 'gtp_embedding_wgrad_fp32', False)
+            )
 
     def _fuse_wgrad_accumulation(self, weight: torch.Tensor) -> bool:
         """Whether the backward adds the weight gradient into ``main_grad`` itself.

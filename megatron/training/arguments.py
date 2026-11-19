@@ -1309,7 +1309,9 @@ def validate_args(args, defaults={}):
         # The FP32-accumulation reduce-scatters only exist to recover FP32 accumulation from a
         # lower-precision wire dtype. With FP32 main_grads the plain ring reduce-scatter already
         # sums in FP32 on both axes, so they buy no precision and cost one extra
-        # unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.
+        # unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter. The GTP embedding
+        # is the exception: its autograd wgrad stays in the param dtype and is reduce-scattered
+        # in BF16; --gtp-embedding-wgrad-fp32 covers that one weight.
         for arg_name in (
             'ddp_reduce_scatter_with_fp32_accumulation',
             'gtp_remat_reduce_scatter_with_fp32_accumulation',

@@ -244,6 +244,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | — | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
 | `--tensor-parallel-num-sequence-shards` | **Optional** | Split sequences within dense GTP groups | TP with SP, otherwise 1 | Includes TP/SP. Within each GTP_remat group, ranks are partitioned into batch-shard groups. Each group processes an independent microbatch, with its ranks handling different sequence partitions. [§2.8](#28-batch-and-sequence-partitioning-within-gtp_remat) |
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
+| `--gtp-embedding-wgrad-fp32` | **Optional** | BF16 params with FP32 main grads | off | The embedding's wgrad stays BF16 even with FP32 main grads; this reduces it with an all-to-all + FP32 sum into `main_grad`, in chunks of ≤ 512 MiB scratch, synchronously. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-opt-in-modules` | **Optional** | MoE models with large `--moe-latent-size` | `[]` | Space-separated list of module tokens to opt in to GTP_remat sharding. Currently supported: `moe_latent_proj` (shards `fc1_latent_proj` / `fc2_latent_proj`; only beneficial when the latent size is large enough to amortize the all-gather). [§1.5](#15-opt-in-minimally-invasive-integration) |
@@ -395,6 +396,29 @@ it** — a different collective over a different process group, so enable either
   behind it in one composite handle — which is why the all-to-alls are issued with
   `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
   handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
+
+**The embedding is the exception to "skip with FP32 main grads"** (`--gtp-embedding-wgrad-fp32`,
+`TransformerConfig.gtp_embedding_wgrad_fp32`, default off). TE linears and the native
+Column/RowParallelLinear emit wgrads in `main_grad`'s dtype, so with FP32 main grads their ring
+reduce-scatter is already FP32. The embedding's wgrad comes from `F.embedding`'s autograd
+backward in the param dtype, so it is pre-scaled and ring-reduce-scattered in BF16 every
+microbatch, and `arguments.py` turns the flag above off whenever
+`--accumulate-allreduce-grads-in-fp32` is set (the bf16 default). With
+`--gtp-embedding-wgrad-fp32` the embedding weight instead runs
+`GTPShardedParam._reduce_wgrads_with_fp32_accumulation`: per hidden-dim column chunk, an
+all-to-all at the wgrad dtype (the bytes of the ring reduce-scatter), an FP32 sum of the peers'
+rows, and an add with the `1/gtp_remat` mean scale (none under `calculate_per_token_loss`) into
+the matching `main_grad` columns.
+
+- **Memory.** Chunk scratch (send + receive at the wgrad dtype plus the FP32 shard sum) is capped
+  at 512 MiB and comes from the caching allocator; nothing is kept between calls. A 163840 x 7168
+  BF16 embedding at GTP_remat=8 runs in 10 chunks of ~504 MiB. For comparison, promoting the whole
+  wgrad to FP32 from the wgrad pool (PR #8109) keeps 4.4 GiB resident per embedding-owning stage.
+- **Time.** About the same wire time as today's BF16 reduce-scatter, plus a strided copy and an
+  FP32 sum per chunk. It is always synchronous: on a stage where the embedding's reduce-scatter
+  was async (the MTP stage) it is no longer overlapped with the rest of the backward.
+- **Scope.** Only weights tagged `_wgrad_reduce_in_fp32` (the GTP embedding, by
+  `VocabParallelEmbedding`) with a BF16/FP16 wgrad; FP32 wgrads keep the ordinary path.
 
 ### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
 
