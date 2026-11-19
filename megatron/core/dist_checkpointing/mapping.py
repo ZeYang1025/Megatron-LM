@@ -423,6 +423,13 @@ class ShardedTensorFactory(ShardedBase):
             factories in different processes
         flattened_range (slice, optional): indicates additional flattening
             applied to the ShardedTensors produced by the factory
+        optimizer_factory (ShardedTensorFactory, optional): companion factory whose
+            data is the live model parameter, for factories whose own data is not the
+            parameter or whose build cannot be applied to optimizer state as is (e.g. GTP
+            local fragments, see ``dist_checkpointing.gtp``). Its build and merge functions
+            map optimizer tensors of the parameter's shape, or flat slices of them, onto the
+            same checkpoint keys and coordinates. Optimizer code reaches it through
+            ``for_optimizer``.
     """
 
     key: str
@@ -431,6 +438,30 @@ class ShardedTensorFactory(ShardedBase):
     merge_fn: FactoryMergeFn
     replica_id: ReplicaId = 0
     flattened_range: Optional[slice] = None
+    optimizer_factory: Optional["ShardedTensorFactory"] = field(default=None, repr=False)
+
+    def for_optimizer(self) -> "ShardedTensorFactory":
+        """Return the factory that describes this parameter's optimizer state.
+
+        That is ``self``, or the companion ``optimizer_factory`` under this factory's current
+        key, so that key rewrites applied to the model factory after construction (layer
+        offsets, prefixes) carry over. For (PP, TP, DP) replica IDs the companion takes the
+        outer PP and DP coordinates from this factory and keeps its own TP coordinate:
+        physical GTP shards are distinct even where the model factory describes replicas.
+        Other replica ID forms are taken from this factory unchanged.
+        """
+        if self.optimizer_factory is None:
+            return self
+        replica_id = self.replica_id
+        companion_replica_id = self.optimizer_factory.replica_id
+        if (
+            isinstance(replica_id, tuple)
+            and len(replica_id) == 3
+            and isinstance(companion_replica_id, tuple)
+            and len(companion_replica_id) == 3
+        ):
+            replica_id = (replica_id[0], companion_replica_id[1], replica_id[2])
+        return replace(self.optimizer_factory, key=self.key, replica_id=replica_id)
 
     def build(self):
         """Builds a ShardedStateDict from the original tensor"""
@@ -441,7 +472,15 @@ class ShardedTensorFactory(ShardedBase):
         pass
 
     def without_data(self):
-        return replace(self, data=None)
+        return replace(
+            self,
+            data=None,
+            optimizer_factory=(
+                self.optimizer_factory.without_data()
+                if self.optimizer_factory is not None
+                else None
+            ),
+        )
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):
