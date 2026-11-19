@@ -202,21 +202,23 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     )
 
 
+@pytest.mark.parametrize("opt_in", [True, False])
 @pytest.mark.parametrize("remat_size", [1, 2])
-def test_latent_rmsnorm_preserves_dev_non_gtp_contract(monkeypatch, remat_size):
+def test_latent_rmsnorm_receives_gtp_groups_and_owning_tp_group(monkeypatch, remat_size, opt_in):
+    """The fused RMSNorm up-projection gets fc1's GTP groups plus its owning TP group."""
+
     class RematGroup(_FakeProcessGroup):
         def size(self):
             return remat_size
 
     class RecordingRMSNormLinear(_RecordingLinear):
-        def __init__(self, *args, **kwargs):
-            assert "gtp_remat_group" not in kwargs
-            assert "gtp_replica_group" not in kwargs
-            super().__init__(*args, **kwargs)
+        calls = []
 
     tp_group = _FakeProcessGroup()
+    gtp_remat_group = RematGroup()
+    gtp_replica_group = _FakeProcessGroup()
     pg_collection = ProcessGroupCollection(
-        tp=tp_group, ep=_FakeProcessGroup(), dp_cp=_FakeProcessGroup(), gtp_remat=RematGroup()
+        tp=tp_group, ep=_FakeProcessGroup(), dp_cp=gtp_replica_group, gtp_remat=gtp_remat_group
     )
     config = TransformerConfig(
         num_layers=1,
@@ -231,22 +233,28 @@ def test_latent_rmsnorm_preserves_dev_non_gtp_contract(monkeypatch, remat_size):
         moe_latent_up_projection_rmsnorm=True,
         use_cpu_initialization=True,
         add_bias_linear=False,
-        gtp_remat_opt_in_modules=["moe_latent_proj"],
+        gtp_remat_opt_in_modules=["moe_latent_proj"] if opt_in else [],
     )
+    _RecordingLinear.calls.clear()
     monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
     monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
     monkeypatch.setattr(moe_layer_module, "TERMSNormDuplicatedLinear", RecordingRMSNormLinear)
     monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
     submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
-    if remat_size > 1:
-        with pytest.raises(
-            ValueError, match="does not yet support.*moe_latent_up_projection_rmsnorm"
-        ):
-            MoELayer(config, submodules, pg_collection=pg_collection)
-    else:
-        layer = MoELayer(config, submodules, pg_collection=pg_collection)
-        assert isinstance(layer.fc2_latent_proj, RecordingRMSNormLinear)
-        assert layer.fc2_latent_proj._tp_group is tp_group
+
+    layer = MoELayer(config, submodules, pg_collection=pg_collection)
+
+    expected_remat_group = gtp_remat_group if opt_in else None
+    assert isinstance(layer.fc2_latent_proj, RecordingRMSNormLinear)
+    # The subclass records into its own list, so each list holds one construction.
+    ((_, fc1_kwargs),) = _RecordingLinear.calls
+    ((_, fc2_kwargs),) = RecordingRMSNormLinear.calls
+    assert "tp_group" not in fc1_kwargs
+    assert fc2_kwargs["tp_group"] is tp_group
+    for kwargs in (fc1_kwargs, fc2_kwargs):
+        assert kwargs["gtp_remat_group"] is expected_remat_group
+        assert kwargs["gtp_replica_group"] is gtp_replica_group
+    assert layer.fc2_latent_proj._tp_group is tp_group
 
 
 @pytest.mark.skipif(

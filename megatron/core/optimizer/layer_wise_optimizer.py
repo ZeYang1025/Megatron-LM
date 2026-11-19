@@ -153,7 +153,13 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
         for name, p in model_chunk.named_parameters():
             if is_gtp_param(p):
                 continue
-            grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
+            # Classify experts by allreduce=False, the marker DDP and the optimizer param groups
+            # use; params carry no is_expert_parallel attribute. Folding the dense gtp_remat rank
+            # into a routed expert's replica_id would be wrong: with dense GTP and expert GTP 1,
+            # dense gtp_remat peers hold different experts, so the fold would leave the expert
+            # shards of every peer but rank 0 without a main replica.
+            is_expert = not getattr(p, 'allreduce', True)
+            grp = egtp_remat_group if is_expert else gtp_remat_group
             if grp is None or grp.size() <= 1:
                 continue
             # Normalize the param name so it matches the optimizer-state checkpoint key suffix,

@@ -15,6 +15,7 @@ from megatron.core.tensor_parallel.random import (
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
+    get_gtp_remat_rng_tracker_name,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -213,6 +214,63 @@ def test_model_parallel_cuda_manual_seed():
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
     Utils.destroy_model_parallel()
+
+
+def test_gtp_remat_rng_tracker_names():
+    dense = get_gtp_remat_rng_tracker_name()
+    expert = get_gtp_remat_rng_tracker_name(is_expert=True)
+    duplicated = get_gtp_remat_rng_tracker_name(duplicated=True)
+    assert len({dense, expert, duplicated}) == 3
+    with pytest.raises(ValueError, match="duplicated across TP"):
+        get_gtp_remat_rng_tracker_name(is_expert=True, duplicated=True)
+
+
+def test_gtp_remat_duplicated_rng_is_tp_invariant():
+    """Weights duplicated across TP are GTP_remat-sharded identically on every TP rank, so
+    their init stream must depend on the GTP_remat rank only, unlike the default GTP stream."""
+
+    def seeded_states(tp_rank, gtp_remat_rank):
+        # Explicit ranks: no process groups are needed to derive the per-rank seeds.
+        model_parallel_cuda_manual_seed(
+            1234,
+            tp_rank=tp_rank,
+            ep_rank=0,
+            etp_rank=0,
+            gtp_remat_rank=gtp_remat_rank,
+            egtp_remat_rank=0,
+            gtp_remat_world_size=2,
+            egtp_remat_world_size=1,
+            force_reset_rng=True,
+        )
+        return {name: state.clone() for name, state in get_cuda_rng_tracker().get_states().items()}
+
+    dense = get_gtp_remat_rng_tracker_name()
+    duplicated = get_gtp_remat_rng_tracker_name(duplicated=True)
+    states = {
+        (tp_rank, gtp_rank): seeded_states(tp_rank, gtp_rank)
+        for tp_rank in (0, 1)
+        for gtp_rank in (0, 1)
+    }
+    for gtp_rank in (0, 1):
+        # Same shard on both TP ranks: identical duplicated stream, TP-specific default stream.
+        assert torch.equal(states[0, gtp_rank][duplicated], states[1, gtp_rank][duplicated])
+        assert not torch.equal(states[0, gtp_rank][dense], states[1, gtp_rank][dense])
+    for tp_rank in (0, 1):
+        # Different shards on different GTP_remat ranks.
+        assert not torch.equal(states[tp_rank, 0][duplicated], states[tp_rank, 1][duplicated])
+    # Without GTP_remat, no GTP stream is registered (a byte-identical non-GTP tracker set).
+    model_parallel_cuda_manual_seed(
+        1234,
+        tp_rank=0,
+        ep_rank=0,
+        etp_rank=0,
+        gtp_remat_rank=0,
+        egtp_remat_rank=0,
+        gtp_remat_world_size=1,
+        egtp_remat_world_size=1,
+        force_reset_rng=True,
+    )
+    assert not {dense, duplicated} & set(get_cuda_rng_tracker().get_states())
 
 
 def test_checkpoint():

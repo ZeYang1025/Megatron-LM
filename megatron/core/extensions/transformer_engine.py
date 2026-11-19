@@ -548,6 +548,7 @@ def _gtp_pre_init(
     is_expert=False,
     rng_via_kwarg=True,
     out_split_size=1,
+    duplicated=False,
 ):
     """Pre-shard ``out_features`` so plain TE builds this rank's shard; route init to a per-rank
     RNG region (``rng_via_kwarg=False`` for LayerNormLinear). Returns ``(out_features, gtp_ctx)``.
@@ -556,6 +557,9 @@ def _gtp_pre_init(
     column-parallel, else 1). GTP pads the per-TP slice (``output_size // out_split_size``) so each
     rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
     post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
+
+    ``duplicated=True`` marks a weight duplicated across TP ranks (``parallel_mode="duplicated"``):
+    TP peers hold the same GTP_remat shard, so its init stream must not depend on the TP rank.
     """
     from megatron.core.tensor_parallel.gtp_api import gtp_remat_shard_dim0
     from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
@@ -567,7 +571,7 @@ def _gtp_pre_init(
     shard_out = per_rank * out_split_size
     gtp_ctx = (gtp_remat_group, pad_length, output_size)
 
-    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
+    tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert, duplicated=duplicated)
     if rng_via_kwarg:
         extra_kwargs["rng_tracker_name"] = tracker_name
     else:
@@ -592,6 +596,14 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None)
     attach_gtp_to_presharded_module(
         module, gtp_remat_group, pad_length, is_grouped=is_grouped, replica_group=replica_group
     )
+    if isinstance(module, te.pytorch.LayerNormLinear):
+        # TE before be880cc2 may size LayerNormLinear's fused-wgrad placeholder gradient from the
+        # unsharded GEMM scratch; the idempotent shim makes it shard-shaped where needed.
+        from megatron.core.extensions.te_gtp_compat import (
+            apply_layernorm_linear_distributed_wgrad_fix,
+        )
+
+        apply_layernorm_linear_distributed_wgrad_fix()
 
 
 @contextmanager
@@ -606,12 +618,14 @@ def _init_gtp_remat_context(
     rng_via_kwarg=True,
     out_split_size=1,
     replica_group=None,
+    duplicated=False,
 ):
     """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
     GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
 
     ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
     ``replica_group`` = the caller's gtp_remat-excluded DP x CP group (checkpoint writer election).
+    ``duplicated`` = the weight is duplicated across TP ranks (TP-invariant init stream).
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         yield output_size
@@ -624,6 +638,7 @@ def _init_gtp_remat_context(
         is_expert=is_expert,
         rng_via_kwarg=rng_via_kwarg,
         out_split_size=out_split_size,
+        duplicated=duplicated,
     )
     yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
@@ -1474,6 +1489,8 @@ class TELinear(te.pytorch.Linear):
             is_expert=is_expert,
             out_split_size=tp_size if te_parallel_mode == "column" else 1,
             replica_group=gtp_replica_group,
+            # TP peers of a duplicated weight hold the same GTP_remat shard.
+            duplicated=parallel_mode == "duplicated",
         )
 
         with init_quant_context, init_gtp_remat_context as output_size:
@@ -1570,7 +1587,12 @@ class TELinear(te.pytorch.Linear):
 
 
 class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
-    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks.
+
+    With a ``gtp_remat_group`` of size > 1, only the linear weight is GTP_remat-sharded along its
+    output dimension (alignment padding included) and rematerialized before the GEMM; the RMSNorm
+    scale and any bias stay replicated at their logical widths.
+    """
 
     def __init__(
         self,
@@ -1586,7 +1608,18 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        """
+        Args:
+            tp_group (ProcessGroup | None): owning TP group, recorded only for checkpoint
+                metadata; TE executes with ``tp_size=1``.
+            gtp_remat_group (ProcessGroup | None): GTP_remat group that shards the linear
+                weight; ``None`` or size 1 keeps the weight replicated.
+            gtp_replica_group (ProcessGroup | None): the GTP_remat-excluded DP x CP group,
+                stamped on the sharded weight to elect its checkpoint writer.
+        """
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -1621,15 +1654,24 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
-        # groups here and wrap TE construction in `_init_gtp_remat_context` with
-        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
-        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
-        # and the rematerialized output keeps the logical [..., output_size] shape.
-        with init_quant_context:
+        # rng_via_kwarg=False: TE's LayerNormLinear constructor has no rng_tracker_name kwarg.
+        # duplicated=True: TP peers hold the same GTP_remat shard, so they must draw the same
+        # init values (the default GTP stream varies with the TP rank).
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            replica_group=gtp_replica_group,
+            duplicated=True,
+        )
+        # Only the linear weight is sharded; the RMSNorm scale keeps its full input width
+        # (TE sizes it from in_features), and the rematerialized output keeps output_size.
+        with init_quant_context, init_gtp_remat_context as gtp_output_size:
             super().__init__(
                 in_features=input_size,
-                out_features=output_size,
+                out_features=gtp_output_size,
                 eps=self.config.layernorm_epsilon,
                 sequence_parallel=False,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
@@ -1648,8 +1690,7 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
                 **extra_kwargs,
             )
 
-        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
-        # shards only the linear weight, so bias must remain replicated at [output_size].
+        # Under GTP the context also restored any bias to its logical, replicated [output_size].
         self._tp_group = (
             tp_group
             if tp_group is not None

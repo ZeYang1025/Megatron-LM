@@ -638,7 +638,7 @@ structure selects routed-only MOK in `auto` mode. Activation selection is indepe
 | Shared experts | Optional; fused shared experts use BF16 and the routed intermediate size, with optional sigmoid output gate via `moe_shared_expert_gate`; native shared experts retain MCore's precision and structure |
 | Activation | SwiGLU or SiTU-GLU, without a linear offset or tanh clamp |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
-| Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast; dense GTP requires native shared execution, expert GTP is unsupported |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
 | CUDA Graph | Full-iteration capture |
@@ -665,10 +665,22 @@ static input token counts alone do not establish that lifecycle.
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
 wgrad, native shared-expert overlap, fused shared-expert-only
-recompute, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
-partial MoE CUDA Graph replay, MCore expert-input
+recompute, expert GTP weight rematerialization, dense GTP with fused shared experts, shortcut
+MoE, inference-optimized layers, partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
+
+Dense GTP (`--tensor-parallel-num-weight-shards` larger than the TP size) composes with MOK when
+shared experts run natively (`shared_expert_mode: native`, or `auto` resolving to native) and
+expert GTP stays off. MOK reads only the routed expert weights, which expert GTP 1 never shards.
+The native shared experts, the router, and the latent projections run as ordinary MCore modules
+around the megakernel call, so their GTP shards follow the usual prefetch chain, recompute chain
+and gradient reduce-scatter; the latent projections are sharded only with
+`--gtp-remat-opt-in-modules moe_latent_proj`. Expert GTP and dense GTP with fused shared experts
+are rejected, because the megakernel would read GTP shards without gathering them.
+`tests/unit_tests/transformer/moe/test_mok_gtp.py` checks on one four-GPU node (EP4, dense GTP4)
+that a latent, routed-only MOK layer reproduces its no-GTP outputs, input gradients and reduced
+gradients, in BF16 and MXFP8 and with shared-expert or whole-MoE recompute.
 
 
 ### GLU Checkpoint Layout

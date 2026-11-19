@@ -1438,7 +1438,9 @@ class TransformerConfig(ModelParallelConfig):
 
       - ``"moe_latent_proj"`` — shard ``fc1_latent_proj`` / ``fc2_latent_proj`` (MoE latent
         projections, ``parallel_mode="duplicated"``). Only beneficial when ``moe_latent_size``
-        is large enough for the all-gather to amortize.
+        is large enough for the all-gather to amortize. With
+        ``moe_latent_up_projection_rmsnorm``, only the linear weight of the fused RMSNorm
+        up-projection is sharded; its RMSNorm scale stays replicated.
     """
 
     gtp_embedding_wgrad_fp32: bool = False
@@ -3959,10 +3961,27 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
+            # MOK reads its weights inside the megakernel, so GTP's per-weight gather and
+            # gradient reduce-scatter never run on them. Dense GTP is supported only while
+            # every weight MOK reads stays unsharded: routed experts need expert GTP = 1,
+            # and shared experts must run natively, where their TE linears rematerialize
+            # GTP shards as usual. The router and latent projections are always native.
+            if self.expert_gtp_weight_remat_size != 1:
                 raise ValueError(
-                    "MOK does not support GTP weight rematerialization; the megakernel "
-                    "bypasses native expert weight-gather hooks"
+                    "MOK does not support expert GTP weight rematerialization "
+                    f"(expert_gtp_weight_remat_size={self.expert_gtp_weight_remat_size}); "
+                    "the megakernel reads routed expert weights directly and bypasses GTP's "
+                    "weight gather and gradient reduce-scatter. Leave "
+                    "expert_tensor_parallel_num_weight_shards unset or equal to "
+                    "expert_tensor_parallel_size"
+                )
+            if self.gtp_weight_remat_size != 1 and fuse_shared:
+                raise ValueError(
+                    "MOK with dense GTP weight rematerialization "
+                    f"(gtp_weight_remat_size={self.gtp_weight_remat_size}) requires shared "
+                    "experts to run natively in MCore: a fused shared expert is read inside "
+                    "the megakernel, which bypasses GTP's weight gather. Set "
+                    "shared_expert_mode='native' in moe_megakernel_backend_config"
                 )
             if self.expert_tensor_parallel_size != 1:
                 raise ValueError("MOK currently requires expert TP=1")
