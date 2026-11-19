@@ -575,6 +575,27 @@ def _mock_backend(
     monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False, routed_only=False
 ):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
+    config, experts, shared, functional = _mock_backend_inputs(
+        monkeypatch,
+        single_grouped=single_grouped,
+        gated=gated,
+        mxfp8=mxfp8,
+        situ=situ,
+        routed_only=routed_only,
+    )
+    original_options = config.moe_megakernel_backend_config.copy()
+    module = mok_backend.MoKMegakernel(
+        config, object(), experts, None if routed_only else shared, 2
+    )
+    assert config.moe_megakernel_backend_config == original_options
+    assert vars(module.mok_config) == {"fwd_num_comm_sms": 32, "bwd_num_comm_sms": 40}
+    return module, shared, functional
+
+
+def _mock_backend_inputs(
+    monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, situ=False, routed_only=False
+):
+    """Stub MOK and build the native expert modules and config the adapter consumes."""
     package = ModuleType("mok")
     functional = ModuleType("mok.functional")
     functional.MoKConfig = lambda **kwargs: SimpleNamespace(**kwargs)
@@ -627,13 +648,53 @@ def _mock_backend(
             "bwd_num_comm_sms": 40,
         },
     )
-    original_options = config.moe_megakernel_backend_config.copy()
-    module = mok_backend.MoKMegakernel(
-        config, object(), experts, None if routed_only else shared, 2
-    )
-    assert config.moe_megakernel_backend_config == original_options
-    assert vars(module.mok_config) == {"fwd_num_comm_sms": 32, "bwd_num_comm_sms": 40}
-    return module, shared, functional
+    return config, experts, shared, functional
+
+
+@pytest.mark.parametrize(
+    "sharded_input, alias",
+    [
+        ("routed_fc1", "routed_fc1_weight1"),
+        ("routed_fc2", "routed_fc2_weight0"),
+        ("shared_fc1", "shared_fc1_weight"),
+        ("shared_fc2", "shared_fc2_weight"),
+        ("shared_gate", "shared_output_gate_weight"),
+    ],
+)
+def test_constructor_rejects_gtp_sharded_inputs(monkeypatch, sharded_input, alias):
+    """MOK refuses GTP shards even if a process-group collection disagrees with the config,
+    because the megakernel reads its registered weights without gathering them. A shard of a
+    shared weight has the wrong shape too, so the GTP error must win over the shape checks."""
+    config, experts, shared, _ = _mock_backend_inputs(monkeypatch, gated=True)
+    shard_rows = {"shared_fc1": 4, "shared_fc2": 4}  # [2I/2, H] and [H/2, I] at GTP 2
+    if sharded_input.startswith("shared_") and sharded_input in shard_rows:
+        linear = getattr(shared, "linear_" + sharded_input.split("_")[1])
+        full = linear.weight
+        linear.weight = torch.nn.Parameter(
+            torch.zeros((shard_rows[sharded_input], full.shape[1]), dtype=full.dtype)
+        )
+        weight = linear.weight
+    elif sharded_input == "shared_gate":
+        weight = shared.gate_weight
+    else:
+        linear = getattr(experts, "linear_" + sharded_input.split("_")[1])
+        weight = linear.get_parameter(f"weight{alias[-1]}")
+    weight.is_gtp_weight_remat = True
+
+    with pytest.raises(ValueError, match=f"GTP-sharded MOK inputs: \\['{alias}'\\]"):
+        mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
+
+
+def test_constructor_accepts_unsharded_inputs_next_to_gtp_shards(monkeypatch):
+    """Dense GTP shards on modules MOK does not read (e.g. native shared experts, latent
+    projections) are irrelevant to the backend; only its own inputs are checked."""
+    config, experts, shared, _ = _mock_backend_inputs(monkeypatch, gated=True, routed_only=True)
+    shared.linear_fc1.weight.is_gtp_weight_remat = True  # native shared expert, not passed in
+
+    module = mok_backend.MoKMegakernel(config, object(), experts, None, 2)
+
+    assert module.shared_fc1_weight is None
+    assert all(not getattr(p, "is_gtp_weight_remat", False) for p in module.parameters())
 
 
 def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):

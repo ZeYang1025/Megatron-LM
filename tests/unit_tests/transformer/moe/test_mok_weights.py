@@ -269,21 +269,6 @@ def test_mok_rejects_gtp_on_weights_the_megakernel_reads(overrides, error):
         _mok_transformer_config(**overrides)
 
 
-def test_mok_backend_rejects_gtp_sharded_inputs():
-    """The backend refuses GTP shards even if a process-group collection disagrees with
-    the config, because the megakernel reads its registered weights without gathering."""
-    from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
-
-    holder = torch.nn.Module()
-    holder.register_parameter("routed_fc1_weight0", torch.nn.Parameter(torch.zeros(2, 2)))
-    holder.register_parameter("shared_fc1_weight", None)
-    MoKMegakernel._reject_gtp_sharded_weights(holder)
-
-    holder.routed_fc1_weight0.is_gtp_weight_remat = True
-    with pytest.raises(ValueError, match="routed_fc1_weight0"):
-        MoKMegakernel._reject_gtp_sharded_weights(holder)
-
-
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
     with pytest.raises(ValueError, match="whole-layer CUDA Graph capture"):

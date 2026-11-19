@@ -35,6 +35,32 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _reject_gtp_sharded_inputs(named_weights) -> None:
+    """Fail fast if a weight MOK reads directly is a GTP shard.
+
+    MOK consumes its registered routed (and fused shared) weights inside the megakernel, so a
+    GTP shard would reach it with no all-gather and no gradient reduce-scatter. TransformerConfig
+    rejects expert GTP and dense GTP with fused shared experts; this catches a process-group
+    collection that disagrees with the config. Callers run it before any shape validation, which
+    a shard would otherwise fail with a misleading message. Dense GTP is fine otherwise: native
+    shared experts, the router and the latent projections are not registered here and
+    rematerialize their own shards.
+
+    Args:
+        named_weights: ``(alias name, weight or None)`` pairs MOK would register and read.
+    """
+    sharded = [
+        name
+        for name, weight in named_weights
+        if weight is not None and getattr(weight, "is_gtp_weight_remat", False)
+    ]
+    if sharded:
+        raise ValueError(
+            "MOK cannot consume GTP-sharded weights; the megakernel bypasses GTP's weight "
+            f"gather and gradient reduce-scatter. GTP-sharded MOK inputs: {sharded}"
+        )
+
+
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
@@ -139,6 +165,10 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
+        # Only the routed aliases are registered so far; _register_shared_weights checks the
+        # shared inputs itself, before its shape checks.
+        _reject_gtp_sharded_inputs(self.named_parameters(recurse=False))
+
         if shared_experts is None:
             self.register_parameter("shared_fc1_weight", None)
             self.register_parameter("shared_fc2_weight", None)
@@ -147,7 +177,6 @@ class MoKMegakernel(MegakernelBackend):
             self._register_shared_weights(
                 shared_experts, use_output_gate=config.moe_shared_expert_gate
             )
-        self._reject_gtp_sharded_weights()
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -210,27 +239,6 @@ class MoKMegakernel(MegakernelBackend):
             self._split_main_grad_descriptor_cache = (fingerprint, (fc1_table, fc2_table))
         return main_grads, self._split_main_grad_descriptor_cache[1]
 
-    def _reject_gtp_sharded_weights(self) -> None:
-        """Fail fast if any weight MOK reads directly is a GTP shard.
-
-        MOK consumes the registered routed (and fused shared) weights inside the
-        megakernel, so a GTP shard would reach it with no all-gather and no gradient
-        reduce-scatter. TransformerConfig rejects expert GTP and dense GTP with fused
-        shared experts; this catches a process-group collection that disagrees with it.
-        Dense GTP is fine otherwise: native shared experts, the router and the latent
-        projections are not registered here and rematerialize their own shards.
-        """
-        sharded = [
-            name
-            for name, param in self.named_parameters(recurse=False)
-            if getattr(param, "is_gtp_weight_remat", False)
-        ]
-        if sharded:
-            raise ValueError(
-                "MOK cannot consume GTP-sharded weights; the megakernel bypasses GTP's weight "
-                f"gather and gradient reduce-scatter. GTP-sharded MOK inputs: {sharded}"
-            )
-
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
         """Finalize and return routed weight gradients."""
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
@@ -240,6 +248,14 @@ class MoKMegakernel(MegakernelBackend):
         """Validate and alias MCore-owned native BF16 shared weights."""
         fc1_ref = shared.linear_fc1.weight
         fc2_ref = shared.linear_fc2.weight
+        output_gate = getattr(shared, "gate_weight", None) if use_output_gate else None
+        _reject_gtp_sharded_inputs(
+            (
+                ("shared_fc1_weight", fc1_ref),
+                ("shared_fc2_weight", fc2_ref),
+                ("shared_output_gate_weight", output_gate),
+            )
+        )
         from megatron.core.fp8_utils import is_float8tensor
 
         i, h = self.intermediate_size, self.hidden_size
@@ -267,7 +283,6 @@ class MoKMegakernel(MegakernelBackend):
         # module remains registered and emits the canonical checkpoint entries.
         self.register_parameter("shared_fc1_weight", fc1_ref)
         self.register_parameter("shared_fc2_weight", fc2_ref)
-        output_gate = getattr(shared, "gate_weight", None) if use_output_gate else None
         if use_output_gate and (
             not isinstance(output_gate, nn.Parameter)
             or is_float8tensor(output_gate)
