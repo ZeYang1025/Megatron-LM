@@ -670,6 +670,9 @@ around the megakernel call, so their GTP shards follow the usual prefetch chain,
 and gradient reduce-scatter; the latent projections are sharded only with
 `--gtp-remat-opt-in-modules moe_latent_proj`. Expert GTP and dense GTP with fused shared experts
 are rejected, because the megakernel would read GTP shards without gathering them.
+`tests/unit_tests/transformer/moe/test_mok_gtp.py` checks on one four-GPU node (EP4, dense GTP4)
+that a latent, routed-only MOK layer reproduces its no-GTP outputs, input gradients and reduced
+gradients, in BF16 and MXFP8 and with shared-expert or whole-MoE recompute.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
