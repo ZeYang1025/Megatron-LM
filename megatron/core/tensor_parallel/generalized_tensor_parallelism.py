@@ -2311,13 +2311,19 @@ class GTPShardedParam(torch.nn.Parameter):
             if not chunks:
                 continue
             max_width = max(end - start for start, end in chunks)
+            # Exactly the three buffers bytes_per_col budgets, sized for the widest chunk and
+            # reused by every chunk. The FP32 sum is written in place too: a fresh one per chunk
+            # would be allocated while the previous chunk's sum is still referenced, so two would
+            # be live at once and the scratch would exceed the cap by one shard sum.
             send_flat = torch.empty(rows_padded * max_width, dtype=wgrad.dtype, device=wgrad.device)
             recv_flat = torch.empty_like(send_flat)
+            sum_flat = torch.empty(shard_rows * max_width, dtype=torch.float32, device=wgrad.device)
             for start, end in chunks:
                 width = end - start
                 # Flat prefixes keep a narrower last chunk contiguous, as the collective needs.
                 send = send_flat[: rows_padded * width].view(rows_padded, width)
                 recv = recv_flat[: rows_padded * width].view(rows_padded, width)
+                shard_sum = sum_flat[: shard_rows * width].view(shard_rows, width)
                 send[:num_rows].copy_(wgrad[:, start:end])
                 if rows_padded > num_rows:
                     send[num_rows:].zero_()
@@ -2326,7 +2332,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 # collective orders the current stream after it, so the next chunk's copy
                 # cannot overwrite a send buffer the all-to-all still reads.
                 torch.distributed.all_to_all_single(recv, send, group=group)
-                shard_sum = recv.view(world_size, shard_rows, width).sum(dim=0, dtype=torch.float32)
+                # Reads the BF16/FP16 rows and accumulates in FP32 (no upcast copy of recv).
+                torch.sum(
+                    recv.view(world_size, shard_rows, width),
+                    dim=0,
+                    dtype=torch.float32,
+                    out=shard_sum,
+                )
                 main_grad[:, start:end].add_(shard_sum, alpha=scale)
         nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32_chunked")
 
