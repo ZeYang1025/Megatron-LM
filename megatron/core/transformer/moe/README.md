@@ -510,6 +510,7 @@ Select MOK with the following YAML configuration:
 
 ```yaml
 bf16: true
+add_bias_linear: false
 moe_grouped_gemm: true
 moe_ffn_hidden_size: 3072
 gradient_accumulation_fusion: true
@@ -530,15 +531,22 @@ This integration targets the
 [MCore integration branch of Mixture-of-Kittens](https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration),
 which is an optional dependency and is imported only when the backend is selected.
 
+Routed-only execution and SiTU-GLU require a MOK build containing the
+[companion support](https://github.com/QiZhangNV/mixture-of-kittens/pull/9). Set
+`shared_expert_mode` inside `moe_megakernel_backend_config`: `auto` (default) fuses compatible
+shared experts, `fused` requires compatibility, and `native` keeps shared experts in MCore.
+Latent projections always stay in MCore; TP>1, latent MoE, or incompatible shared structure
+selects routed-only MOK in `auto` mode. Activation selection is independent.
+
 | Area | Current MOK support |
 |------|---------------------|
 | GPU architecture | NVIDIA Blackwell; validated on GB300 |
 | Routed precision | BF16, or MXFP8 with FP8 parameter gather (Transformer Engine 2.10 or later) |
-| Shared experts | Required; BF16; same intermediate size as routed experts |
-| Activation | SwiGLU |
+| Shared experts | Optional; MOK-fused shared experts use BF16 and the routed intermediate size, with an optional sigmoid output gate via `moe_shared_expert_gate`; native shared experts retain MCore's precision and structure |
+| Activation | SwiGLU or SiTU-GLU |
 | Routed weight layout | Single-grouped and per-expert non-single weights |
-| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64} |
-| Recomputation | Whole-MoE activation recompute; MOK forward-context recompute (`--moe-mok-recompute-forward-context`, MOK d59188a or newer, not with a MOK-fused gated shared expert) |
+| Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64} |
+| Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native; MOK forward-context recompute (`--moe-mok-recompute-forward-context`, MOK d59188a or newer, not with a MOK-fused gated shared expert) |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
@@ -562,10 +570,10 @@ rebuild a gated fused shared expert's context, so that combination is rejected. 
 alike), with the same checks as the flag.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
-MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap/gating, shared-expert-only
-recompute, latent MoE, overload-factor logging, partial MoE CUDA Graph replay, MCore expert-input
-capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
-layouts.
+linear biases, MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap, MOK-fused
+shared-expert-only recompute, overload-factor logging, partial MoE CUDA Graph replay, MCore
+expert-input capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between
+physical weight layouts.
 
 
 ### CUDA Graph
